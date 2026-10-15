@@ -519,6 +519,23 @@ def generate_local_hairstyle_transfer(
     raw_generated_512 = diffusion_output.images[0]
     raw_generated_orig = raw_generated_512.resize((w_orig, h_orig), Image.Resampling.LANCZOS)
 
+    # Preserve protected face and ear pixels from diffusion changes.
+    if alignment_result is not None:
+        hard_protection = alignment_result.get("hard_protection")
+        if hard_protection is not None:
+            protection = np.asarray(hard_protection)
+            if protection.ndim == 3:
+                protection = protection[:, :, 0]
+            if protection.shape != (h_orig, w_orig):
+                protection = cv2.resize(
+                    protection.astype(np.uint8),
+                    (w_orig, h_orig),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+            edit_arr = np.asarray(edit_mask.convert("L")).copy()
+            edit_arr[protection > 0] = 0
+            edit_mask = Image.fromarray(edit_arr, mode="L")
+
     # 8. Feathered Boundary Compositing
     # Blends diffusion inpainting strictly into the narrow edge repair seam
     # while preserving the central reference hair pixels and curls 100% intact!
@@ -583,7 +600,7 @@ def generate_local_hairstyle_transfer(
                 target_image=target_image,
                 reference_image=reference_image,
                 hair_mask=target_hair_mask,
-                edit_mask=edit_mask,
+                edit_mask=broad_edit_mask if broad_edit_mask is not None else edit_mask,
                 composite_image=final_composite,
                 metadata=metadata,
                 metrics=metrics,
