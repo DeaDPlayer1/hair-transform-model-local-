@@ -1,0 +1,23 @@
+{
+  "id": "2_crop_only",
+  "name": "Revised Reference Crop Only",
+  "legacy_crop": false,
+  "bounded_decontamination": false,
+  "seed": 42,
+  "steps": 8,
+  "scale": 0.75,
+  "duration_seconds": 143.33,
+  "metrics": {
+    "dimension_match": true,
+    "max_outside_pixel_diff": 0,
+    "mean_outside_pixel_diff": 0.0,
+    "outside_preservation_pct": 100.0,
+    "facial_features_protected": true,
+    "facial_features_max_diff": 0,
+    "has_nan_or_inf": false,
+    "is_blank_image": false,
+    "edit_mask_coverage_pct": 17.7,
+    "duration_seconds": 143.23,
+    "peak_memory_mb": 7582.1
+  }
+}

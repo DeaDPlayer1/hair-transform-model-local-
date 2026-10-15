@@ -1,0 +1,23 @@
+{
+  "id": "1_baseline",
+  "name": "Baseline (Legacy Gray Fade + Broad Decontam)",
+  "legacy_crop": true,
+  "bounded_decontamination": false,
+  "seed": 42,
+  "steps": 8,
+  "scale": 0.75,
+  "duration_seconds": 177.35,
+  "metrics": {
+    "dimension_match": true,
+    "max_outside_pixel_diff": 0,
+    "mean_outside_pixel_diff": 0.0,
+    "outside_preservation_pct": 100.0,
+    "facial_features_protected": true,
+    "facial_features_max_diff": 0,
+    "has_nan_or_inf": false,
+    "is_blank_image": false,
+    "edit_mask_coverage_pct": 17.7,
+    "duration_seconds": 177.27,
+    "peak_memory_mb": 4747.5
+  }
+}
