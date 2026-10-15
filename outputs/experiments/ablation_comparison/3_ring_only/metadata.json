@@ -1,0 +1,23 @@
+{
+  "id": "3_ring_only",
+  "name": "Bounded Edge Ring Only",
+  "legacy_crop": true,
+  "bounded_decontamination": true,
+  "seed": 42,
+  "steps": 8,
+  "scale": 0.75,
+  "duration_seconds": 136.37,
+  "metrics": {
+    "dimension_match": true,
+    "max_outside_pixel_diff": 0,
+    "mean_outside_pixel_diff": 0.0,
+    "outside_preservation_pct": 100.0,
+    "facial_features_protected": true,
+    "facial_features_max_diff": 0,
+    "has_nan_or_inf": false,
+    "is_blank_image": false,
+    "edit_mask_coverage_pct": 17.7,
+    "duration_seconds": 136.3,
+    "peak_memory_mb": 7465.3
+  }
+}
