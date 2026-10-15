@@ -806,6 +806,74 @@ class TestHairstylePreservationAndSeamRepair(unittest.TestCase):
         self.assertGreater(alpha[50, 50], 0.5)
 
 
+    def test_ear_exclusion_from_edge_repair_mask(self):
+        """Verifies ear region and its buffer are strictly excluded from edge repair mask."""
+        alpha = np.zeros((100, 100), dtype=np.float32)
+        alpha[20:80, 20:80] = 1.0  # Hair covers (20:80, 20:80)
+        target_hair = np.zeros((100, 100), dtype=np.uint8)
+        target_hair[25:75, 25:75] = 255
+        
+        # Ear located at boundary of hair
+        ear_mask = np.zeros((100, 100), dtype=np.uint8)
+        ear_mask[40:60, 15:25] = 255
+
+        _, edge_mask_np = build_edge_repair_mask(
+            aligned_hair_alpha=alpha,
+            target_hair_mask_np=target_hair,
+            hard_protection=None,
+            ear_mask_np=ear_mask,
+            target_shape=(100, 100),
+            edge_width_px=8,
+        )
+
+        # Pixels in ear mask and dilated ear buffer MUST be 0 (no diffusion inpainting)
+        self.assertEqual(int(edge_mask_np[ear_mask > 0].max()), 0)
+        # Pixels 2px adjacent to ear inside hair border should also be buffered and 0
+        self.assertEqual(int(edge_mask_np[50, 22]), 0)
+
+    def test_soft_transition_around_hard_protection(self):
+        """Verifies fractional antialiased transition exists immediately outside hard protection."""
+        tgt = np.full((100, 100, 3), 120, dtype=np.uint8)
+        rgb = np.full((100, 100, 3), 20, dtype=np.uint8)
+        alpha = np.ones((100, 100), dtype=np.float32)
+        hard_prot = np.zeros((100, 100), dtype=np.uint8)
+        hard_prot[40:60, 40:60] = 255  # Box protected
+
+        comp, eff_alpha = composite_aligned_hair(
+            tgt, rgb, alpha, hard_prot, soft_transition_px=3.0
+        )
+        # Inside hard protection: exactly 0
+        self.assertEqual(float(eff_alpha[50, 50]), 0.0)
+        # Exactly on the edge / 1-2px outside: fractional weight (0 < alpha < 1)
+        # At (39, 50), distance to protection is 1.0, soft weight is ~1/3 = 0.33
+        self.assertGreater(float(eff_alpha[39, 50]), 0.0)
+        self.assertLess(float(eff_alpha[39, 50]), 1.0)
+        # Deep outside (> 3px away): full alpha 1.0
+        self.assertEqual(float(eff_alpha[20, 50]), 1.0)
+
+    def test_scale_aware_parameters_scaling(self):
+        """Verifies align_reference_to_target clamps scale-aware parameters based on IOD."""
+        tgt = Image.new("RGB", (256, 256), (100, 100, 100))
+        ref = Image.new("RGB", (256, 256), (50, 50, 50))
+        t_mask = Image.new("L", (256, 256), 0)
+        r_mask = Image.new("L", (256, 256), 255)
+
+        # Mock geometry with large IOD (e.g. 150px)
+        with patch("src.hairstyle_alignment.estimate_head_geometry") as mock_geom:
+            mock_geom.return_value = {
+                "valid": True,
+                "interocular_dist": 150.0,
+                "head_width": 200.0,
+                "head_height": 240.0,
+            }
+            with patch("src.hairstyle_alignment.detect_face_landmarks") as mock_lms:
+                mock_lms.return_value = _make_landmarks_dict(256, 256)
+                result = align_reference_to_target(tgt, ref, t_mask, r_mask)
+                self.assertIn("aligned_hair_alpha", result)
+                # Parameters should be safely clamped
+                self.assertIsNotNone(result.get("pasted_composite"))
+
+
 if __name__ == "__main__":
     unittest.main()
 

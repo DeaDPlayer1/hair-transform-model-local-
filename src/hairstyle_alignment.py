@@ -665,9 +665,12 @@ def composite_aligned_hair(
     aligned_hair_rgb: np.ndarray,
     aligned_hair_alpha: np.ndarray,
     hard_protection: Optional[np.ndarray] = None,
+    soft_transition_px: float = 3.0,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Composite aligned reference hair onto target image with facial feature protection.
+    Uses fractional smoothly-weighted transitions outside hard protection to prevent
+    sharp 1-pixel binary boundary steps.
 
     Returns:
         (pasted_composite_rgb, effective_alpha):
@@ -687,7 +690,14 @@ def composite_aligned_hair(
     if hard_protection is not None:
         if hard_protection.shape[:2] != (h, w):
             hard_protection = cv2.resize(hard_protection, (w, h), interpolation=cv2.INTER_NEAREST)
+        # Strictly zero out alpha inside hard protection (100% bit-exact facial & ear protection)
         alpha[hard_protection > 0] = 0.0
+
+        # Fractional smoothly-weighted transition in narrow adjacent hair rim
+        if soft_transition_px > 0.0 and np.any(hard_protection > 0):
+            dist_outside = cv2.distanceTransform((hard_protection == 0).astype(np.uint8), cv2.DIST_L2, 5)
+            smooth_weight = np.clip(dist_outside / float(soft_transition_px), 0.0, 1.0).astype(np.float32)
+            alpha = alpha * smooth_weight
 
     alpha_3ch = alpha[..., None]
     composite = (
@@ -704,6 +714,7 @@ def build_edge_repair_mask(
     hard_protection: Optional[np.ndarray],
     target_shape: Tuple[int, int],
     edge_width_px: int = 12,
+    ear_mask_np: Optional[np.ndarray] = None,
 ) -> Tuple[Image.Image, np.ndarray]:
     """
     Build a dedicated, narrow edge-repair mask around the hairstyle boundary.
@@ -717,6 +728,8 @@ def build_edge_repair_mask(
     4. Any uncovered old target hair sticking out around the new hairstyle is INCLUDED (255)
        so diffusion can remove it without leaving old curls underneath.
     5. Protected facial features, ears, and clothing are STRICTLY EXCLUDED (0).
+    6. Ear cartilage and its immediate margin are STRICTLY EXCLUDED (0) so diffusion
+       does not hallucinate pink skin / deformed ears along the ear boundary.
 
     Returns:
         (edge_repair_mask_pil, edge_repair_mask_np)
@@ -769,6 +782,20 @@ def build_edge_repair_mask(
         if prot.shape[:2] != (h, w):
             prot = cv2.resize(prot, (w, h), interpolation=cv2.INTER_NEAREST)
         combined_mask[prot > 0] = 0
+
+    # F. Exclude ear margin from diffusion inpainting
+    # Inpainting directly along the ear margin causes diffusion to hallucinate pink skin / deformed ears.
+    # The pre-composited reference hair already integrates smoothly with the ear.
+    if ear_mask_np is not None and np.any(ear_mask_np > 0):
+        ear_m = ear_mask_np
+        if ear_m.shape[:2] != (h, w):
+            ear_m = cv2.resize(ear_m, (w, h), interpolation=cv2.INTER_NEAREST)
+        k_buf_size = max(5, int(round(w_px * 1.2)))
+        if k_buf_size % 2 == 0:
+            k_buf_size += 1
+        k_ear_buf = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_buf_size, k_buf_size))
+        ear_buffer = cv2.dilate((ear_m > 0).astype(np.uint8) * 255, k_ear_buf, iterations=1)
+        combined_mask[ear_buffer > 0] = 0
 
     edge_mask_np = (combined_mask > 128).astype(np.uint8) * 255
     edge_mask_pil = Image.fromarray(edge_mask_np, mode="L")
@@ -1126,6 +1153,21 @@ def align_reference_to_target(
         strength=0.40,
     )
 
+    # ── Scale-aware parameter derivation from head geometry ──
+    soft_transition_px = 3.0
+    if target_geom.get("valid") and target_geom.get("interocular_dist"):
+        iod = float(target_geom["interocular_dist"])
+        edge_width_px = int(np.clip(round(iod * 0.12), 8, 20))
+        feather_width_px = float(np.clip(round(iod * 0.06), 4.0, 10.0))
+        soft_transition_px = float(np.clip(round(iod * 0.03), 2.0, 5.0))
+        cranial_expansion_px = int(np.clip(round(iod * 0.20), 12, 30))
+    else:
+        edge_width_px = 12
+
+    ear_mask_np = None
+    if target_segmentation_map is not None:
+        ear_mask_np = np.isin(target_segmentation_map, EAR_SEG_CLASSES).astype(np.uint8) * 255
+
     # ── Composite aligned reference hair directly onto target portrait ──
     # Facial features are strictly protected; central curls stay 100% intact
     pasted_composite_np, effective_alpha = composite_aligned_hair(
@@ -1133,6 +1175,7 @@ def align_reference_to_target(
         aligned_hair_rgb=harmonized_rgb,
         aligned_hair_alpha=warped_alpha * transition_weight,
         hard_protection=hard_protection,
+        soft_transition_px=soft_transition_px,
     )
 
     # ── Build dedicated narrow edge repair mask ──
@@ -1141,7 +1184,8 @@ def align_reference_to_target(
         target_hair_mask_np=target_hair_np,
         hard_protection=hard_protection,
         target_shape=target_shape,
-        edge_width_px=12,
+        edge_width_px=edge_width_px,
+        ear_mask_np=ear_mask_np,
     )
 
     # ── Build broad envelope mask and compositing alpha for audit ──

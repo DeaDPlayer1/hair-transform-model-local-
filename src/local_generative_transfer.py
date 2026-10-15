@@ -487,7 +487,17 @@ def generate_local_hairstyle_transfer(
     else:
         negative_prompt = negative_prompt_base
 
-    device_to_use = getattr(pipe, "device", torch.device("cpu"))
+    device_attr = getattr(pipe, "device", "cpu")
+    if isinstance(device_attr, torch.device):
+        device_to_use = device_attr
+    elif isinstance(device_attr, str):
+        try:
+            device_to_use = torch.device(device_attr)
+        except Exception:
+            device_to_use = torch.device("cpu")
+    else:
+        device_to_use = torch.device("cpu")
+
     generator = torch.Generator(device=device_to_use).manual_seed(seed)
 
     if progress_callback:
