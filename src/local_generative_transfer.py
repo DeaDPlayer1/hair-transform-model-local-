@@ -37,6 +37,7 @@ from src.hair_mask_refinement import (
     build_refined_edit_mask,
     build_feathered_blend_mask,
     composite_with_feathering,
+    refine_reference_hair_mask,
 )
 from src.transfer_evaluation import (
     evaluate_transfer_metrics,
@@ -110,6 +111,7 @@ def prepare_reference_crop(
         mask_np = np.asarray(reference_hair_mask.convert("L"), dtype=np.uint8)
         if mask_np.shape[:2] != (h, w):
             mask_np = cv2.resize(mask_np, (w, h), interpolation=cv2.INTER_NEAREST)
+        mask_np, _ = refine_reference_hair_mask(ref_rgb, mask_np)
         hair_indices = mask_np > 128
     else:
         hair_indices = np.ones((h, w), dtype=bool)
@@ -485,7 +487,8 @@ def generate_local_hairstyle_transfer(
     else:
         negative_prompt = negative_prompt_base
 
-    generator = torch.Generator(device="cpu").manual_seed(seed)
+    device_to_use = getattr(pipe, "device", torch.device("cpu"))
+    generator = torch.Generator(device=device_to_use).manual_seed(seed)
 
     if progress_callback:
         progress_callback(f"Running CPU diffusion inpainting ({num_inference_steps} steps, scale={ip_adapter_scale})...")
@@ -544,7 +547,7 @@ def generate_local_hairstyle_transfer(
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         "model_id": "stable-diffusion-v1-5/stable-diffusion-inpainting",
         "ip_adapter_weight": "ip-adapter-plus_sd15.bin",
-        "device": "cpu",
+        "device": str(getattr(pipe, "device", "cpu")),
         "target_size": [w_orig, h_orig],
         "inference_resolution": [512, 512],
         "num_inference_steps": num_inference_steps,

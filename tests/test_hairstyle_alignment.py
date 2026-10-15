@@ -708,6 +708,77 @@ class TestHairstylePreservationAndSeamRepair(unittest.TestCase):
         unknown_mask = result_bounded["unknown_region_mask"]
         self.assertLess(np.count_nonzero(unknown_mask), 100 * 100 * 0.5)
 
+    def test_bounded_decontamination_is_hair_rim_only(self):
+        """Bounded unknown region must not extend into exterior studio backdrop."""
+        tgt = Image.new("RGB", (100, 100), (120, 100, 80))
+        ref_arr = np.full((100, 100, 3), 220, dtype=np.uint8)
+        ref_arr[35:65, 35:65] = [40, 30, 20]
+        ref = Image.fromarray(ref_arr)
+        t_mask = Image.new("L", (100, 100), 0)
+        r_mask_np = np.zeros((100, 100), dtype=np.uint8)
+        r_mask_np[35:65, 35:65] = 255
+        r_mask = Image.fromarray(r_mask_np)
+
+        result = align_reference_to_target(
+            target_image=tgt,
+            reference_image=ref,
+            target_hair_mask=t_mask,
+            reference_hair_mask=r_mask,
+            bounded_decontamination=True,
+        )
+        unknown = result["unknown_region_mask"]
+        outside_hair = r_mask_np == 0
+        self.assertEqual(int(np.count_nonzero(unknown[outside_hair])), 0)
+
+    def test_backdrop_pruning_removes_large_studio_pockets(self):
+        """Large parser-filled studio pockets inside the hair blob must be removed."""
+        ref_arr = np.full((120, 120, 3), 220, dtype=np.uint8)
+        ref_arr[20:100, 20:100] = [45, 32, 24]
+        ref_arr[48:72, 48:72] = [220, 220, 220]  # large interior pocket
+        ref = Image.fromarray(ref_arr)
+        tgt = Image.new("RGB", (120, 120), (110, 95, 80))
+        t_mask = Image.new("L", (120, 120), 0)
+        r_mask_np = np.zeros((120, 120), dtype=np.uint8)
+        r_mask_np[20:100, 20:100] = 255
+        r_mask = Image.fromarray(r_mask_np)
+
+        result = align_reference_to_target(
+            target_image=tgt,
+            reference_image=ref,
+            target_hair_mask=t_mask,
+            reference_hair_mask=r_mask,
+        )
+        alpha = result["reference_hair_alpha"]
+        self.assertLess(float(alpha[60, 60]), 0.05)
+
+    def test_pasted_composite_rejects_white_hair_fringe(self):
+        """A white ring mislabeled as hair must not survive as a pale pasted halo."""
+        tgt = np.full((120, 120, 3), 90, dtype=np.uint8)
+        tgt[40:80, 40:80] = [180, 140, 120]
+        tgt_img = Image.fromarray(tgt)
+        ref_arr = np.full((120, 120, 3), 225, dtype=np.uint8)
+        ref_arr[30:90, 30:90] = [50, 35, 25]
+        ref = Image.fromarray(ref_arr)
+        t_mask = Image.new("L", (120, 120), 0)
+        r_mask_np = np.zeros((120, 120), dtype=np.uint8)
+        r_mask_np[25:95, 25:95] = 255  # 5px white fringe labeled as hair
+        r_mask = Image.fromarray(r_mask_np)
+
+        result = align_reference_to_target(
+            target_image=tgt_img,
+            reference_image=ref,
+            target_hair_mask=t_mask,
+            reference_hair_mask=r_mask,
+        )
+        pasted = np.asarray(result["pasted_composite"])
+        alpha = result["effective_hair_alpha"]
+        fringe = (alpha > 0.08) & (alpha < 0.9)
+        if np.any(fringe):
+            luma = (
+                0.2126 * pasted[..., 0] + 0.7152 * pasted[..., 1] + 0.0722 * pasted[..., 2]
+            )
+            self.assertLess(float(luma[fringe].mean()), 160.0)
+
     def test_backdrop_pruning_protects_deep_hair_core(self):
         """Verify bright highlights in deep hair core are NOT removed by backdrop pruning."""
         ref_arr = np.full((100, 100, 3), 220, dtype=np.uint8)  # backdrop ~220

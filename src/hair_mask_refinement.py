@@ -19,7 +19,135 @@ from PIL import Image
 # 6: eye_g (glasses), 7: l_ear, 8: r_ear, 9: ear_r, 10: nose, 11: mouth,
 # 12: u_lip, 13: l_lip, 14: neck, 15: neck_l, 16: cloth, 17: hair, 18: hat
 PROTECTED_SEG_CLASSES = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]  # brows, eyes, nose, mouth, ears
+FACIAL_FEATURE_SEG_CLASSES = [2, 3, 4, 5, 6, 10, 11, 12, 13]  # brows, eyes, nose, mouth (excludes ears)
+EAR_SEG_CLASSES = [7, 8, 9]  # l_ear, r_ear, ear_r
 CLOTHING_SEG_CLASSES = [16]
+
+
+def refine_reference_hair_mask(
+    reference_rgb: np.ndarray,
+    reference_hair_mask: np.ndarray,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """
+    Prune studio-backdrop pixels that the hair parser labeled as hair.
+
+    Keeps real interior highlights (small enclosed backdrop-like blobs) and
+    dark hair. Removes large curl-gap pockets and perimeter fringe that match
+    the studio backdrop. Does not globally strip bright pixels.
+    """
+    ref_rgb = reference_rgb
+    ref_hair_np = reference_hair_mask
+    h_r, w_r = ref_rgb.shape[:2]
+    if ref_hair_np.shape[:2] != (h_r, w_r):
+        ref_hair_np = cv2.resize(ref_hair_np, (w_r, h_r), interpolation=cv2.INTER_NEAREST)
+
+    hair = ref_hair_np > 128
+    border_px = max(10, int(round(15 * (max(h_r, w_r) / 512.0))))
+    top_b = ref_rgb[:border_px, :]
+    left_b = ref_rgb[:, :border_px]
+    right_b = ref_rgb[:, -border_px:]
+    perim_rgb = np.concatenate(
+        [top_b.reshape(-1, 3), left_b.reshape(-1, 3), right_b.reshape(-1, 3)], axis=0
+    )
+    perim_hair = np.concatenate(
+        [
+            hair[:border_px].reshape(-1),
+            hair[:, :border_px].reshape(-1),
+            hair[:, -border_px:].reshape(-1),
+        ]
+    )
+    bg_perim = perim_rgb[~perim_hair]
+    if len(bg_perim) > 30:
+        backdrop_color = np.median(bg_perim, axis=0)
+        backdrop_std = float(np.std(bg_perim, axis=0).max())
+    else:
+        corners = np.concatenate([ref_rgb[:25, :25], ref_rgb[:25, -25:]], axis=1)
+        backdrop_color = corners.mean(axis=(0, 1))
+        backdrop_std = float(corners.std(axis=(0, 1)).max())
+
+    color_dist = np.linalg.norm(ref_rgb.astype(np.float32) - backdrop_color, axis=-1)
+    prune_threshold = max(24.0, backdrop_std * 3.5)
+    is_backdrop = color_dist < prune_threshold
+
+    hair_u8 = hair.astype(np.uint8)
+    core_deep_k = max(5, int(round(7 * (max(h_r, w_r) / 512.0))))
+    if core_deep_k % 2 == 0:
+        core_deep_k += 1
+    hair_core_deep = cv2.erode(
+        hair_u8, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (core_deep_k, core_deep_k))
+    )
+
+    backdrop_hair = (hair & is_backdrop).astype(np.uint8)
+    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(backdrop_hair, connectivity=8)
+    highlight_max = max(16, int(round(48.0 * ((max(h_r, w_r) / 512.0) ** 2))))
+
+    prune_mask = np.zeros((h_r, w_r), dtype=bool)
+    for i in range(1, n_labels):
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        x = int(stats[i, cv2.CC_STAT_LEFT])
+        y = int(stats[i, cv2.CC_STAT_TOP])
+        bw = int(stats[i, cv2.CC_STAT_WIDTH])
+        bh = int(stats[i, cv2.CC_STAT_HEIGHT])
+        touches_border = x <= 0 or y <= 0 or (x + bw) >= w_r or (y + bh) >= h_r
+        component = labels == i
+        in_deep_core = bool(np.any(hair_core_deep[component] > 0))
+        # Keep only tiny interior highlight specks; prune fringe and large pockets.
+        if area <= highlight_max and in_deep_core and not touches_border:
+            continue
+        prune_mask[component] = True
+
+    cleaned = ref_hair_np.copy()
+    cleaned[prune_mask] = 0
+    info = {
+        "pruned_count": int(np.count_nonzero(prune_mask)),
+        "backdrop_color": backdrop_color,
+        "is_backdrop": is_backdrop,
+        "prune_mask": prune_mask,
+    }
+    return cleaned, info
+
+
+def decontaminate_reference_hair_rgb(
+    reference_rgb: np.ndarray,
+    ref_hair_binary: np.ndarray,
+    bounded_decontamination: bool = True,
+    ring_radius_px: Optional[int] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Replace contaminated hair-edge RGB with interior hair color.
+
+    Bounded mode inpaints only pixels that are inside the hair mask but outside
+    the eroded core, so TELEA cannot sample exterior studio backdrop.
+    """
+    h_r, w_r = reference_rgb.shape[:2]
+    binary = (ref_hair_binary > 0).astype(np.uint8)
+    scale_ref = max(h_r, w_r) / 512.0
+    erode_k = max(3, int(round(5.0 * scale_ref)))
+    if erode_k % 2 == 0:
+        erode_k += 1
+    k_erode = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (erode_k, erode_k))
+    core_hair = cv2.erode(binary, k_erode, iterations=1)
+    if not np.any(core_hair > 0):
+        k_erode_3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        core_hair = cv2.erode(binary, k_erode_3, iterations=1)
+        if not np.any(core_hair > 0):
+            core_hair = binary.copy()
+
+    if not bounded_decontamination:
+        unknown_region = (core_hair == 0).astype(np.uint8)
+        inpaint_radius = 7
+    else:
+        # Hair-rim only. ring_radius_px is retained for callers but no longer
+        # dilates into exterior backdrop (that was sampling white studio fill).
+        _ = ring_radius_px
+        inpaint_radius = max(3, int(round(7.0 * scale_ref)))
+        unknown_region = ((binary > 0) & (core_hair == 0)).astype(np.uint8)
+
+    if np.any(core_hair > 0) and np.any(unknown_region > 0):
+        decontaminated_rgb = cv2.inpaint(reference_rgb, unknown_region, inpaint_radius, cv2.INPAINT_TELEA)
+    else:
+        decontaminated_rgb = reference_rgb.copy()
+    return decontaminated_rgb, unknown_region
 
 
 def build_refined_edit_mask(
