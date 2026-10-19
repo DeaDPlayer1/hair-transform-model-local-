@@ -60,6 +60,8 @@ outputs/robustness_campaign/**/alignment_diagnostics/
 outputs/two_stage_runs/
 outputs/pair2_generation/
 outputs/my_hairstyle_test/
+outputs/my_random_test_*/
 outputs/debug_overlays/
 models/bald_converter/
 scratch/
+
