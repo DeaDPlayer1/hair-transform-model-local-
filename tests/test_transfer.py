@@ -14,8 +14,14 @@ import cv2
 class TestHairstyleTransfer(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.target_img = Image.open("assets/download.jpg").convert("RGB")
-        cls.ref_img = Image.open("assets/image.png").convert("RGB")
+        assets_dir = Path("assets")
+        targets = sorted([p for p in assets_dir.glob("target*") if p.suffix.lower() in [".jpg", ".jpeg", ".png", ".webp"]])
+        refs = sorted([p for p in assets_dir.glob("reference*") if p.suffix.lower() in [".jpg", ".jpeg", ".png", ".webp"]])
+        target_path = targets[0] if targets else assets_dir / "target.jpg"
+        ref_path = refs[0] if refs else assets_dir / "reference.jpg"
+
+        cls.target_img = Image.open(target_path).convert("RGB")
+        cls.ref_img = Image.open(ref_path).convert("RGB")
 
         # Create dummy hair masks for testing
         w_t, h_t = cls.target_img.size

@@ -42,11 +42,24 @@ outputs/experiments/ear_halo_fixed_run/
 outputs/experiments/final_halo_fix_*
 outputs/halo_diagnosis_latest/
 outputs/halo_fix_validation/
+outputs/latest_user_generation/
 assets/reference.png
 scripts/diagnose_*.py
+scripts/generate_*.py
 scripts/run_*.py
+!scripts/run_robustness_campaign.py
 scripts/test_ear_*.py
 scripts/test_isolated_*.py
 scripts/test_targeted_*.py
 scripts/trace_*.py
 scripts/validate_*.py
+
+# Large generation outputs
+outputs/robustness_campaign/**/pair_runs/
+outputs/robustness_campaign/**/alignment_diagnostics/
+outputs/two_stage_runs/
+outputs/pair2_generation/
+outputs/my_hairstyle_test/
+outputs/debug_overlays/
+models/bald_converter/
+scratch/

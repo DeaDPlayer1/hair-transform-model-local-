@@ -1,0 +1,91 @@
+{
+  "timestamp": "2026-10-19 14:48:00",
+  "project_root": "D:\\HairTryOn",
+  "initial_git_state": {
+    "branch": "main",
+    "head_commit": "4c050b5 fix(transfer): enforce hard protection on inpainting blend mask and persist broad edit mask",
+    "tracking_remote": "origin/main (https://github.com/DeaDPlayer1/hair-transform-model-local-.git)"
+  },
+  "environment": {
+    "python_version": "3.11.4",
+    "pytorch_version": "2.14.1+cpu",
+    "cuda_available": false,
+    "diffusers_version": "0.41.0",
+    "mediapipe_version": "1.1.0",
+    "onnxruntime_version": "1.31.0",
+    "opencv_version": "5.0.0",
+    "pillow_version": "12.3.0"
+  },
+  "test_suite_baseline": {
+    "total_tests_collected": 87,
+    "passed": 82,
+    "failed": 0,
+    "errors": 5,
+    "failure_details": [
+      {
+        "module": "tests/test_transfer.py",
+        "error_type": "FileNotFoundError",
+        "cause": "Hardcoded legacy asset paths ('assets/download.jpg', 'assets/image.png') that no longer exist in current assets directory.",
+        "affected_tests": [
+          "test_baseline_bbox_fallback",
+          "test_landmark_detection",
+          "test_mirror_vs_unmirrored",
+          "test_pose_and_mirroring_analysis",
+          "test_transfer_dimensions"
+        ]
+      },
+      {
+        "module": "scripts/test_local_generative_transfer.py",
+        "error_type": "ImportMismatchError",
+        "cause": "Pytest default discovery attempts to import scripts/test_local_generative_transfer.py alongside tests/test_local_generative_transfer.py leading to module name collision when pytest is run without directory filter."
+      }
+    ]
+  },
+  "cli_scripts_baseline": {
+    "single_stage": {
+      "path": "scripts/try_hair.py",
+      "help_status": "PASS",
+      "warning": "Emits ~30 Streamlit ScriptRunContext warnings during CLI invocation due to top-level 'from app import segment_hair'."
+    },
+    "two_stage": {
+      "path": "scripts/try_hair_two_stage.py",
+      "help_status": "PASS",
+      "warning": "Emits ~30 Streamlit ScriptRunContext warnings during CLI invocation due to top-level 'from app import segment_hair'."
+    }
+  },
+  "model_backends_baseline": {
+    "segmentation": {
+      "model": "ResNet18 ONNX Face Parser",
+      "path": "models/resnet18.onnx",
+      "status": "AVAILABLE_LOCAL"
+    },
+    "landmarks": {
+      "model": "MediaPipe FaceLandmarker",
+      "path": "models/face_landmarker.task",
+      "status": "AVAILABLE_LOCAL"
+    },
+    "stage1_bald_converter": {
+      "onnx_model": null,
+      "onnx_model_path": "models/bald_converter/ (empty, specification only)",
+      "configured_backend": "auto -> sd-inpaint",
+      "sd_inpaint_cache": "stable-diffusion-v1-5/stable-diffusion-inpainting (15.2 GB in HF cache)",
+      "status": "FALLBACK_SD_INPAINT_CONFIRMED"
+    },
+    "stage2_hair_transfer": {
+      "ip_adapter_model": "h94/IP-Adapter (2.7 GB in HF cache)",
+      "sd_inpaint_model": "stable-diffusion-v1-5/stable-diffusion-inpainting (15.2 GB in HF cache)",
+      "status": "AVAILABLE_LOCAL"
+    },
+    "controlnet": {
+      "status": "NOT_AVAILABLE",
+      "reason": "No compatible ControlNet weights found locally or in HF cache. System operates via landmark alignment and IP-Adapter reference conditioning as documented."
+    }
+  },
+  "dataset_summary": {
+    "targets_count": 5,
+    "references_count": 5,
+    "total_combinations": 25,
+    "readability_rate_pct": 100.0,
+    "face_detection_rate_pct": 100.0
+  }
+}

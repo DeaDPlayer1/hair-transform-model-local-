@@ -301,6 +301,7 @@ def generate_local_hairstyle_transfer(
     progress_callback: Optional[callable] = None,
     legacy_crop: bool = False,
     bounded_decontamination: bool = True,
+    donor_coverage_threshold: float = 0.85,
 ) -> Dict[str, Any]:
     """
     Run local generative hairstyle transfer using Stable Diffusion Inpainting + IP-Adapter Plus.
@@ -384,6 +385,7 @@ def generate_local_hairstyle_transfer(
             hairline_transition_px=hairline_transition_px,
             save_previews_dir=preview_dir,
             bounded_decontamination=bounded_decontamination,
+            donor_coverage_threshold=donor_coverage_threshold,
         )
 
         # Base portrait on which inpainting operates: has the aligned reference curls pre-composited
@@ -519,11 +521,13 @@ def generate_local_hairstyle_transfer(
     raw_generated_512 = diffusion_output.images[0]
     raw_generated_orig = raw_generated_512.resize((w_orig, h_orig), Image.Resampling.LANCZOS)
 
-    # Preserve protected face and ear pixels from diffusion changes.
+    # Preserve tight identity (face, ear, eye, brow, mouth) pixels from diffusion changes
     if alignment_result is not None:
-        hard_protection = alignment_result.get("hard_protection")
-        if hard_protection is not None:
-            protection = np.asarray(hard_protection)
+        ident_protection = alignment_result.get("identity_protection")
+        if ident_protection is None:
+            ident_protection = alignment_result.get("hard_protection")
+        if ident_protection is not None:
+            protection = np.asarray(ident_protection)
             if protection.ndim == 3:
                 protection = protection[:, :, 0]
             if protection.shape != (h_orig, w_orig):

@@ -1,0 +1,553 @@
+{
+  "iteration": "iteration_001",
+  "timestamp": "2026-10-19 14:50:24",
+  "total_pairs_evaluated": 25,
+  "passed_count": 13,
+  "failed_count": 0,
+  "blocked_count": 0,
+  "needs_visual_review_count": 12,
+  "pair_results": [
+    {
+      "pair_id": "pair_01_target3_x_reference1",
+      "test_order": 1,
+      "target": "target3.jpg",
+      "reference": "reference1.jpg",
+      "status": "NEEDS_VISUAL_REVIEW",
+      "failure_reasons": [
+        "High uncovered target hair ratio: 100.0%"
+      ],
+      "warnings": [],
+      "metrics": {
+        "target_hair_coverage_pct": 15.69,
+        "reference_hair_coverage_pct": 13.69,
+        "donor_alpha_coverage_pct": 0.0,
+        "donor_target_overlap_pct": 0.0,
+        "uncovered_target_hair_pct": 100.0,
+        "ref_backdrop_pruned_px": 46123,
+        "identity_protection_leak_px": 0,
+        "yaw_diff": 2.69
+      }
+    },
+    {
+      "pair_id": "pair_02_target2_x_reference2",
+      "test_order": 2,
+      "target": "target2.jpg",
+      "reference": "reference2.jpg",
+      "status": "NEEDS_VISUAL_REVIEW",
+      "failure_reasons": [
+        "High uncovered target hair ratio: 77.6%"
+      ],
+      "warnings": [
+        "Pruned 827 false-positive backdrop pixels from reference hair mask."
+      ],
+      "metrics": {
+        "target_hair_coverage_pct": 16.62,
+        "reference_hair_coverage_pct": 14.81,
+        "donor_alpha_coverage_pct": 3.86,
+        "donor_target_overlap_pct": 20.98,
+        "uncovered_target_hair_pct": 77.57,
+        "ref_backdrop_pruned_px": 203706,
+        "identity_protection_leak_px": 0,
+        "yaw_diff": 5.36
+      }
+    },
+    {
+      "pair_id": "pair_03_target1_x_reference4",
+      "test_order": 3,
+      "target": "target1.png",
+      "reference": "reference4.jpg",
+      "status": "PASS",
+      "failure_reasons": [],
+      "warnings": [
+        "Pruned 310 false-positive backdrop pixels from reference hair mask."
+      ],
+      "metrics": {
+        "target_hair_coverage_pct": 13.62,
+        "reference_hair_coverage_pct": 8.66,
+        "donor_alpha_coverage_pct": 15.02,
+        "donor_target_overlap_pct": 76.82,
+        "uncovered_target_hair_pct": 21.59,
+        "ref_backdrop_pruned_px": 5771,
+        "identity_protection_leak_px": 0,
+        "yaw_diff": 2.98
+      }
+    },
+    {
+      "pair_id": "pair_04_target3_x_reference4",
+      "test_order": 4,
+      "target": "target3.jpg",
+      "reference": "reference4.jpg",
+      "status": "PASS",
+      "failure_reasons": [],
+      "warnings": [
+        "Pruned 310 false-positive backdrop pixels from reference hair mask."
+      ],
+      "metrics": {
+        "target_hair_coverage_pct": 15.69,
+        "reference_hair_coverage_pct": 8.66,
+        "donor_alpha_coverage_pct": 21.2,
+        "donor_target_overlap_pct": 92.68,
+        "uncovered_target_hair_pct": 6.4,
+        "ref_backdrop_pruned_px": 5771,
+        "identity_protection_leak_px": 0,
+        "yaw_diff": 0.54
+      }
+    },
+    {
+      "pair_id": "pair_05_target3_x_reference3",
+      "test_order": 5,
+      "target": "target3.jpg",
+      "reference": "reference3.jpg",
+      "status": "PASS",
+      "failure_reasons": [],
+      "warnings": [
+        "Pruned 103 false-positive backdrop pixels from reference hair mask."
+      ],
+      "metrics": {
+        "target_hair_coverage_pct": 15.69,
+        "reference_hair_coverage_pct": 17.04,
+        "donor_alpha_coverage_pct": 26.17,
+        "donor_target_overlap_pct": 92.5,
+        "uncovered_target_hair_pct": 6.67,
+        "ref_backdrop_pruned_px": 1108,
+        "identity_protection_leak_px": 0,
+        "yaw_diff": 1.91
+      }
+    },
+    {
+      "pair_id": "pair_06_target1_x_reference1",
+      "test_order": 6,
+      "target": "target1.png",
+      "reference": "reference1.jpg",
+      "status": "NEEDS_VISUAL_REVIEW",
+      "failure_reasons": [
+        "High uncovered target hair ratio: 100.0%"
+      ],
+      "warnings": [],
+      "metrics": {
+        "target_hair_coverage_pct": 13.62,
+        "reference_hair_coverage_pct": 13.69,
+        "donor_alpha_coverage_pct": 0.0,
+        "donor_target_overlap_pct": 0.0,
+        "uncovered_target_hair_pct": 100.0,
+        "ref_backdrop_pruned_px": 46123,
+        "identity_protection_leak_px": 0,
+        "yaw_diff": 5.13
+      }
+    },
+    {
+      "pair_id": "pair_07_target1_x_reference",
+      "test_order": 7,
+      "target": "target1.png",
+      "reference": "reference.jpg",
+      "status": "PASS",
+      "failure_reasons": [],
+      "warnings": [
+        "Pruned 555 false-positive backdrop pixels from reference hair mask."
+      ],
+      "metrics": {
+        "target_hair_coverage_pct": 13.62,
+        "reference_hair_coverage_pct": 27.76,
+        "donor_alpha_coverage_pct": 27.36,
+        "donor_target_overlap_pct": 80.68,
+        "uncovered_target_hair_pct": 18.88,
+        "ref_backdrop_pruned_px": 21237,
+        "identity_protection_leak_px": 0,
+        "yaw_diff": 2.9
+      }
+    },
+    {
+      "pair_id": "pair_08_target2_x_reference",
+      "test_order": 8,
+      "target": "target2.jpg",
+      "reference": "reference.jpg",
+      "status": "PASS",
+      "failure_reasons": [],
+      "warnings": [
+        "Pruned 555 false-positive backdrop pixels from reference hair mask."
+      ],
+      "metrics": {
+        "target_hair_coverage_pct": 16.62,
+        "reference_hair_coverage_pct": 27.76,
+        "donor_alpha_coverage_pct": 13.68,
+        "donor_target_overlap_pct": 68.82,
+        "uncovered_target_hair_pct": 30.02,
+        "ref_backdrop_pruned_px": 21237,
+        "identity_protection_leak_px": 0,
+        "yaw_diff": 6.11
+      }
+    },
+    {
+      "pair_id": "pair_09_target3_x_reference",
+      "test_order": 9,
+      "target": "target3.jpg",
+      "reference": "reference.jpg",
+      "status": "PASS",
+      "failure_reasons": [],
+      "warnings": [
+        "Pruned 555 false-positive backdrop pixels from reference hair mask."
+      ],
+      "metrics": {
+        "target_hair_coverage_pct": 15.69,
+        "reference_hair_coverage_pct": 27.76,
+        "donor_alpha_coverage_pct": 36.75,
+        "donor_target_overlap_pct": 97.83,
+        "uncovered_target_hair_pct": 1.74,
+        "ref_backdrop_pruned_px": 21237,
+        "identity_protection_leak_px": 0,
+        "yaw_diff": 0.46
+      }
+    },
+    {
+      "pair_id": "pair_10_target4_x_reference1",
+      "test_order": 10,
+      "target": "target4.jpg",
+      "reference": "reference1.jpg",
+      "status": "NEEDS_VISUAL_REVIEW",
+      "failure_reasons": [
+        "High uncovered target hair ratio: 100.0%"
+      ],
+      "warnings": [],
+      "metrics": {
+        "target_hair_coverage_pct": 17.26,
+        "reference_hair_coverage_pct": 13.69,
+        "donor_alpha_coverage_pct": 0.0,
+        "donor_target_overlap_pct": 0.0,
+        "uncovered_target_hair_pct": 100.0,
+        "ref_backdrop_pruned_px": 46123,
+        "identity_protection_leak_px": 0,
+        "yaw_diff": 1.99
+      }
+    },
+    {
+      "pair_id": "pair_11_target2_x_reference1",
+      "test_order": 11,
+      "target": "target2.jpg",
+      "reference": "reference1.jpg",
+      "status": "NEEDS_VISUAL_REVIEW",
+      "failure_reasons": [
+        "High uncovered target hair ratio: 100.0%"
+      ],
+      "warnings": [],
+      "metrics": {
+        "target_hair_coverage_pct": 16.62,
+        "reference_hair_coverage_pct": 13.69,
+        "donor_alpha_coverage_pct": 0.0,
+        "donor_target_overlap_pct": 0.0,
+        "uncovered_target_hair_pct": 100.0,
+        "ref_backdrop_pruned_px": 46123,
+        "identity_protection_leak_px": 0,
+        "yaw_diff": 8.33
+      }
+    },
+    {
+      "pair_id": "pair_12_target3_x_reference2",
+      "test_order": 12,
+      "target": "target3.jpg",
+      "reference": "reference2.jpg",
+      "status": "NEEDS_VISUAL_REVIEW",
+      "failure_reasons": [
+        "High uncovered target hair ratio: 43.4%"
+      ],
+      "warnings": [
+        "Pruned 827 false-positive backdrop pixels from reference hair mask."
+      ],
+      "metrics": {
+        "target_hair_coverage_pct": 15.69,
+        "reference_hair_coverage_pct": 14.81,
+        "donor_alpha_coverage_pct": 12.59,
+        "donor_target_overlap_pct": 53.46,
+        "uncovered_target_hair_pct": 43.45,
+        "ref_backdrop_pruned_px": 203706,
+        "identity_protection_leak_px": 0,
+        "yaw_diff": 0.28
+      }
+    },
+    {
+      "pair_id": "pair_13_target_x_reference1",
+      "test_order": 13,
+      "target": "target.jpg",
+      "reference": "reference1.jpg",
+      "status": "NEEDS_VISUAL_REVIEW",
+      "failure_reasons": [
+        "High uncovered target hair ratio: 100.0%"
+      ],
+      "warnings": [],
+      "metrics": {
+        "target_hair_coverage_pct": 8.9,
+        "reference_hair_coverage_pct": 13.69,
+        "donor_alpha_coverage_pct": 0.0,
+        "donor_target_overlap_pct": 0.0,
+        "uncovered_target_hair_pct": 100.0,
+        "ref_backdrop_pruned_px": 46123,
+        "identity_protection_leak_px": 0,
+        "yaw_diff": 2.97
+      }
+    },
+    {
+      "pair_id": "pair_14_target2_x_reference4",
+      "test_order": 14,
+      "target": "target2.jpg",
+      "reference": "reference4.jpg",
+      "status": "NEEDS_VISUAL_REVIEW",
+      "failure_reasons": [
+        "High uncovered target hair ratio: 57.4%"
+      ],
+      "warnings": [
+        "Pruned 310 false-positive backdrop pixels from reference hair mask."
+      ],
+      "metrics": {
+        "target_hair_coverage_pct": 16.62,
+        "reference_hair_coverage_pct": 8.66,
+        "donor_alpha_coverage_pct": 7.22,
+        "donor_target_overlap_pct": 41.29,
+        "uncovered_target_hair_pct": 57.4,
+        "ref_backdrop_pruned_px": 5771,
+        "identity_protection_leak_px": 0,
+        "yaw_diff": 6.19
+      }
+    },
+    {
+      "pair_id": "pair_15_target4_x_reference2",
+      "test_order": 15,
+      "target": "target4.jpg",
+      "reference": "reference2.jpg",
+      "status": "NEEDS_VISUAL_REVIEW",
+      "failure_reasons": [
+        "High uncovered target hair ratio: 61.2%"
+      ],
+      "warnings": [
+        "Pruned 827 false-positive backdrop pixels from reference hair mask."
+      ],
+      "metrics": {
+        "target_hair_coverage_pct": 17.26,
+        "reference_hair_coverage_pct": 14.81,
+        "donor_alpha_coverage_pct": 8.42,
+        "donor_target_overlap_pct": 36.29,
+        "uncovered_target_hair_pct": 61.18,
+        "ref_backdrop_pruned_px": 203706,
+        "identity_protection_leak_px": 0,
+        "yaw_diff": 0.98
+      }
+    },
+    {
+      "pair_id": "pair_16_target2_x_reference3",
+      "test_order": 16,
+      "target": "target2.jpg",
+      "reference": "reference3.jpg",
+      "status": "NEEDS_VISUAL_REVIEW",
+      "failure_reasons": [
+        "High uncovered target hair ratio: 48.7%"
+      ],
+      "warnings": [
+        "Pruned 103 false-positive backdrop pixels from reference hair mask."
+      ],
+      "metrics": {
+        "target_hair_coverage_pct": 16.62,
+        "reference_hair_coverage_pct": 17.04,
+        "donor_alpha_coverage_pct": 9.22,
+        "donor_target_overlap_pct": 50.44,
+        "uncovered_target_hair_pct": 48.75,
+        "ref_backdrop_pruned_px": 1108,
+        "identity_protection_leak_px": 0,
+        "yaw_diff": 7.55
+      }
+    },
+    {
+      "pair_id": "pair_17_target_x_reference2",
+      "test_order": 17,
+      "target": "target.jpg",
+      "reference": "reference2.jpg",
+      "status": "NEEDS_VISUAL_REVIEW",
+      "failure_reasons": [
+        "High uncovered target hair ratio: 47.6%"
+      ],
+      "warnings": [
+        "Pruned 827 false-positive backdrop pixels from reference hair mask."
+      ],
+      "metrics": {
+        "target_hair_coverage_pct": 8.9,
+        "reference_hair_coverage_pct": 14.81,
+        "donor_alpha_coverage_pct": 7.15,
+        "donor_target_overlap_pct": 48.91,
+        "uncovered_target_hair_pct": 47.63,
+        "ref_backdrop_pruned_px": 203706,
+        "identity_protection_leak_px": 0,
+        "yaw_diff": 0.0
+      }
+    },
+    {
+      "pair_id": "pair_18_target4_x_reference3",
+      "test_order": 18,
+      "target": "target4.jpg",
+      "reference": "reference3.jpg",
+      "status": "PASS",
+      "failure_reasons": [],
+      "warnings": [
+        "Pruned 103 false-positive backdrop pixels from reference hair mask."
+      ],
+      "metrics": {
+        "target_hair_coverage_pct": 17.26,
+        "reference_hair_coverage_pct": 17.04,
+        "donor_alpha_coverage_pct": 19.2,
+        "donor_target_overlap_pct": 83.11,
+        "uncovered_target_hair_pct": 15.86,
+        "ref_backdrop_pruned_px": 1108,
+        "identity_protection_leak_px": 0,
+        "yaw_diff": 1.21
+      }
+    },
+    {
+      "pair_id": "pair_19_target_x_reference4",
+      "test_order": 19,
+      "target": "target.jpg",
+      "reference": "reference4.jpg",
+      "status": "PASS",
+      "failure_reasons": [],
+      "warnings": [
+        "Pruned 310 false-positive backdrop pixels from reference hair mask.",
+        "Similarity transform rejected: Low alignment confidence: 0.38 < 0.4. Using fallback."
+      ],
+      "metrics": {
+        "target_hair_coverage_pct": 8.9,
+        "reference_hair_coverage_pct": 8.66,
+        "donor_alpha_coverage_pct": 11.63,
+        "donor_target_overlap_pct": 91.15,
+        "uncovered_target_hair_pct": 8.3,
+        "ref_backdrop_pruned_px": 5771,
+        "identity_protection_leak_px": 0,
+        "yaw_diff": 0.82
+      }
+    },
+    {
+      "pair_id": "pair_20_target4_x_reference4",
+      "test_order": 20,
+      "target": "target4.jpg",
+      "reference": "reference4.jpg",
+      "status": "PASS",
+      "failure_reasons": [],
+      "warnings": [
+        "Pruned 310 false-positive backdrop pixels from reference hair mask."
+      ],
+      "metrics": {
+        "target_hair_coverage_pct": 17.26,
+        "reference_hair_coverage_pct": 8.66,
+        "donor_alpha_coverage_pct": 15.38,
+        "donor_target_overlap_pct": 78.05,
+        "uncovered_target_hair_pct": 19.95,
+        "ref_backdrop_pruned_px": 5771,
+        "identity_protection_leak_px": 0,
+        "yaw_diff": 0.15
+      }
+    },
+    {
+      "pair_id": "pair_21_target1_x_reference2",
+      "test_order": 21,
+      "target": "target1.png",
+      "reference": "reference2.jpg",
+      "status": "NEEDS_VISUAL_REVIEW",
+      "failure_reasons": [
+        "High uncovered target hair ratio: 60.1%"
+      ],
+      "warnings": [
+        "Pruned 827 false-positive backdrop pixels from reference hair mask."
+      ],
+      "metrics": {
+        "target_hair_coverage_pct": 13.62,
+        "reference_hair_coverage_pct": 14.81,
+        "donor_alpha_coverage_pct": 8.87,
+        "donor_target_overlap_pct": 37.03,
+        "uncovered_target_hair_pct": 60.12,
+        "ref_backdrop_pruned_px": 203706,
+        "identity_protection_leak_px": 0,
+        "yaw_diff": 2.16
+      }
+    },
+    {
+      "pair_id": "pair_22_target1_x_reference3",
+      "test_order": 22,
+      "target": "target1.png",
+      "reference": "reference3.jpg",
+      "status": "PASS",
+      "failure_reasons": [],
+      "warnings": [
+        "Pruned 103 false-positive backdrop pixels from reference hair mask."
+      ],
+      "metrics": {
+        "target_hair_coverage_pct": 13.62,
+        "reference_hair_coverage_pct": 17.04,
+        "donor_alpha_coverage_pct": 20.4,
+        "donor_target_overlap_pct": 80.9,
+        "uncovered_target_hair_pct": 18.15,
+        "ref_backdrop_pruned_px": 1108,
+        "identity_protection_leak_px": 0,
+        "yaw_diff": 4.34
+      }
+    },
+    {
+      "pair_id": "pair_23_target_x_reference",
+      "test_order": 23,
+      "target": "target.jpg",
+      "reference": "reference.jpg",
+      "status": "PASS",
+      "failure_reasons": [],
+      "warnings": [
+        "Pruned 555 false-positive backdrop pixels from reference hair mask.",
+        "Similarity transform rejected: Low alignment confidence: 0.38 < 0.4. Using fallback."
+      ],
+      "metrics": {
+        "target_hair_coverage_pct": 8.9,
+        "reference_hair_coverage_pct": 27.76,
+        "donor_alpha_coverage_pct": 19.88,
+        "donor_target_overlap_pct": 89.07,
+        "uncovered_target_hair_pct": 9.72,
+        "ref_backdrop_pruned_px": 21237,
+        "identity_protection_leak_px": 0,
+        "yaw_diff": 0.75
+      }
+    },
+    {
+      "pair_id": "pair_24_target_x_reference3",
+      "test_order": 24,
+      "target": "target.jpg",
+      "reference": "reference3.jpg",
+      "status": "PASS",
+      "failure_reasons": [],
+      "warnings": [
+        "Pruned 103 false-positive backdrop pixels from reference hair mask.",
+        "Similarity transform rejected: Low alignment confidence: 0.38 < 0.4. Using fallback."
+      ],
+      "metrics": {
+        "target_hair_coverage_pct": 8.9,
+        "reference_hair_coverage_pct": 17.04,
+        "donor_alpha_coverage_pct": 14.39,
+        "donor_target_overlap_pct": 87.9,
+        "uncovered_target_hair_pct": 11.84,
+        "ref_backdrop_pruned_px": 1108,
+        "identity_protection_leak_px": 0,
+        "yaw_diff": 2.19
+      }
+    },
+    {
+      "pair_id": "pair_25_target4_x_reference",
+      "test_order": 25,
+      "target": "target4.jpg",
+      "reference": "reference.jpg",
+      "status": "PASS",
+      "failure_reasons": [],
+      "warnings": [
+        "Pruned 555 false-positive backdrop pixels from reference hair mask."
+      ],
+      "metrics": {
+        "target_hair_coverage_pct": 17.26,
+        "reference_hair_coverage_pct": 27.76,
+        "donor_alpha_coverage_pct": 27.82,
+        "donor_target_overlap_pct": 95.46,
+        "uncovered_target_hair_pct": 4.12,
+        "ref_backdrop_pruned_px": 21237,
+        "identity_protection_leak_px": 0,
+        "yaw_diff": 0.23
+      }
+    }
+  ]
+}

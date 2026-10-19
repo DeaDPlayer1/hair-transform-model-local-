@@ -18,6 +18,7 @@ Covers:
 import unittest
 from unittest.mock import patch, MagicMock
 import numpy as np
+import cv2
 from PIL import Image
 
 from src.hairstyle_alignment import (
@@ -872,6 +873,253 @@ class TestHairstylePreservationAndSeamRepair(unittest.TestCase):
                 self.assertIn("aligned_hair_alpha", result)
                 # Parameters should be safely clamped
                 self.assertIsNotNone(result.get("pasted_composite"))
+
+
+    def test_semi_transparent_donor_coverage_includes_old_hair_in_repair(self):
+        """Verifies old target hair under semi-transparent donor hair (alpha < 0.85) is marked for repair."""
+        alpha = np.zeros((100, 100), dtype=np.float32)
+        # Semi-transparent donor hair (alpha = 0.50)
+        alpha[20:60, 20:80] = 0.50
+        target_hair = np.zeros((100, 100), dtype=np.uint8)
+        target_hair[30:50, 30:70] = 255  # Old target hair
+
+        # Under new default threshold 0.85:
+        _, edge_mask_85 = build_edge_repair_mask(
+            aligned_hair_alpha=alpha,
+            target_hair_mask_np=target_hair,
+            hard_protection=None,
+            target_shape=(100, 100),
+            edge_width_px=8,
+            donor_coverage_threshold=0.85,
+        )
+        # Under old threshold 0.30:
+        _, edge_mask_30 = build_edge_repair_mask(
+            aligned_hair_alpha=alpha,
+            target_hair_mask_np=target_hair,
+            hard_protection=None,
+            target_shape=(100, 100),
+            edge_width_px=8,
+            donor_coverage_threshold=0.30,
+        )
+
+        # In the old-hair interior (e.g. 40, 50), threshold 0.85 marks it for repair (255)
+        self.assertEqual(edge_mask_85[40, 50], 255, "Old hair under semi-transparent donor was not marked for repair!")
+        # Under threshold 0.30, it was incorrectly excluded (0) leaving old hair bleed-through
+        self.assertEqual(edge_mask_30[40, 50], 0, "Old threshold 0.30 unexpectedly marked old hair!")
+
+    def test_donor_core_preserved_under_solid_coverage(self):
+        """Verifies dense donor hair (alpha >= 0.85) preserves central curls from inpainting."""
+        alpha = np.zeros((100, 100), dtype=np.float32)
+        alpha[10:70, 15:85] = 1.0  # Solid dense donor curls
+        target_hair = np.zeros((100, 100), dtype=np.uint8)
+        target_hair[25:55, 30:70] = 255
+
+        _, edge_mask = build_edge_repair_mask(
+            aligned_hair_alpha=alpha,
+            target_hair_mask_np=target_hair,
+            hard_protection=None,
+            target_shape=(100, 100),
+            edge_width_px=8,
+            donor_coverage_threshold=0.85,
+        )
+        # Deep interior of solid hair (40, 50) must be 0 (protected donor curls)
+        self.assertEqual(edge_mask[40, 50], 0, "Solid donor core curls were not preserved!")
+
+    def test_dynamic_replacement_mask_union_and_margins(self):
+        """Verifies target_edit_mask dynamically unions old target hair and aligned donor hair."""
+        alpha = np.zeros((100, 100), dtype=np.float32)
+        alpha[10:50, 40:80] = 0.90  # Donor hair on right
+        target_hair = np.zeros((100, 100), dtype=np.uint8)
+        target_hair[20:60, 20:60] = 255  # Old hair on left
+        hard_prot = np.zeros((100, 100), dtype=np.uint8)
+        transition = np.ones((100, 100), dtype=np.float32)
+
+        masks = build_alignment_masks(
+            aligned_hair_alpha=alpha,
+            target_hair_mask_np=target_hair,
+            hard_protection=hard_prot,
+            transition_weight=transition,
+            target_shape=(100, 100),
+            cranial_expansion_px=6,
+        )
+        edit_arr = np.asarray(masks["target_edit_mask"])
+        # Should cover old target hair on left
+        self.assertEqual(edit_arr[40, 25], 255)
+        # Should cover donor hair on right
+        self.assertEqual(edit_arr[30, 75], 255)
+        # Should cover expanded cranial region above (dilated from y=10 to y=9 with k=3 kernel)
+        self.assertEqual(edit_arr[9, 50], 255)
+
+    def test_scale_aware_kernels_across_image_resolutions(self):
+        """Verifies mask generation works and scales across 256x256, 512x512, and 1024x1024."""
+        for size in [256, 512, 1024]:
+            alpha = np.zeros((size, size), dtype=np.float32)
+            alpha[int(size * 0.1):int(size * 0.6), int(size * 0.2):int(size * 0.8)] = 0.95
+            tgt_hair = np.zeros((size, size), dtype=np.uint8)
+            tgt_hair[int(size * 0.2):int(size * 0.5), int(size * 0.25):int(size * 0.75)] = 255
+
+            _, edge_mask = build_edge_repair_mask(
+                aligned_hair_alpha=alpha,
+                target_hair_mask_np=tgt_hair,
+                hard_protection=None,
+                target_shape=(size, size),
+                edge_width_px=12,
+                donor_coverage_threshold=0.85,
+            )
+            self.assertEqual(edge_mask.shape, (size, size))
+            self.assertGreater(np.count_nonzero(edge_mask), 0)
+
+    def test_pose_mismatch_warning_reported(self):
+        """Verifies significant pose mismatch adds an explicit warning in alignment_result."""
+        tgt = Image.new("RGB", (256, 256), (100, 100, 100))
+        ref = Image.new("RGB", (256, 256), (50, 50, 50))
+        t_mask = Image.new("L", (256, 256), 255)
+        r_mask = Image.new("L", (256, 256), 255)
+
+        t_lms = _make_landmarks_dict(256, 256)
+        t_lms["yaw"] = 0.0  # Frontal target
+        r_lms = _make_landmarks_dict(256, 256)
+        r_lms["yaw"] = 50.0  # Angled reference (+50 deg)
+
+        res = align_reference_to_target(
+            target_image=tgt,
+            reference_image=ref,
+            target_hair_mask=t_mask,
+            reference_hair_mask=r_mask,
+            target_landmarks=t_lms,
+            reference_landmarks=r_lms,
+        )
+        self.assertIn("warnings", res)
+        # Should have viewpoint mismatch warning
+        warnings_str = " ".join(res["warnings"])
+        self.assertIn("viewpoint mismatch", warnings_str.lower())
+
+    def test_old_hair_inside_protection_buffer_included_in_repair_mask(self):
+        """
+        Regression test: Old target hair pixels inside the dilated protection buffer
+        (near the ear/temple) MUST remain in the repair mask so diffusion can fix them,
+        while non-hair buffer pixels are blocked from inpainting.
+        """
+        h, w = 100, 100
+        # Target hair has old hair abutting the ear at x in [20, 40], y in [40, 70]
+        tgt_hair = np.zeros((h, w), dtype=np.uint8)
+        tgt_hair[40:70, 20:40] = 255
+
+        # Donor hair does NOT cover this lower region (alpha = 0)
+        alpha = np.zeros((h, w), dtype=np.float32)
+        alpha[10:45, 30:80] = 1.0
+
+        # Identity protection: exact ear cartilage at x in [10, 20], y in [40, 60]
+        identity_prot = np.zeros((h, w), dtype=np.uint8)
+        identity_prot[40:60, 10:20] = 255
+
+        # Buffer protection: dilated margin around ear covering x in [5, 28], y in [35, 65]
+        # (Notice x in [20, 28] overlaps old target hair!)
+        buffer_prot = np.zeros((h, w), dtype=np.uint8)
+        buffer_prot[35:65, 5:28] = 255
+
+        _, edge_mask = build_edge_repair_mask(
+            aligned_hair_alpha=alpha,
+            target_hair_mask_np=tgt_hair,
+            hard_protection=buffer_prot,
+            target_shape=(h, w),
+            edge_width_px=8,
+            identity_protection=identity_prot,
+            buffer_protection=buffer_prot,
+            donor_coverage_threshold=0.85,
+        )
+
+        # 1. Old target hair inside the buffer (y=50, x=24) MUST be 255 (marked for repair)
+        self.assertEqual(
+            edge_mask[50, 24],
+            255,
+            "Old target hair inside dilated protection buffer was incorrectly wiped from repair mask!",
+        )
+
+        # 2. Genuine ear cartilage in identity_protection (y=50, x=15) MUST be 0 (unconditionally protected)
+        self.assertEqual(
+            edge_mask[50, 15],
+            0,
+            "Real ear cartilage in identity_protection was not protected!",
+        )
+
+        # 3. Non-hair skin pixels in the buffer (y=36, x=10) MUST be 0 (blocked from inpainting bleed)
+        self.assertEqual(
+            edge_mask[36, 10],
+            0,
+            "Buffer protection failed to block non-hair skin pixel from inpainting!",
+        )
+
+    def test_identity_protection_pixels_strictly_excluded_under_any_input(self):
+        """
+        Regression test: Under any adversarial input (even full image hair and boundary seam),
+        identity_protection pixels must strictly and unconditionally have mask value 0.
+        """
+        h, w = 120, 120
+        # Fully saturated target hair across entire canvas
+        tgt_hair = np.full((h, w), 255, dtype=np.uint8)
+        alpha = np.full((h, w), 0.5, dtype=np.float32)
+
+        # Define identity protection (ears, eyes, nose, mouth)
+        identity_prot = np.zeros((h, w), dtype=np.uint8)
+        identity_prot[30:50, 30:50] = 255
+        identity_prot[60:80, 50:70] = 255
+
+        # Buffer protection is dilated
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        buffer_prot = cv2.dilate(identity_prot, k, iterations=1)
+
+        _, edge_mask = build_edge_repair_mask(
+            aligned_hair_alpha=alpha,
+            target_hair_mask_np=tgt_hair,
+            hard_protection=buffer_prot,
+            target_shape=(h, w),
+            edge_width_px=10,
+            identity_protection=identity_prot,
+            buffer_protection=buffer_prot,
+            donor_coverage_threshold=0.85,
+        )
+
+        # Count nonzero pixels in identity region
+        leak_count = np.count_nonzero(edge_mask[identity_prot > 0])
+        self.assertEqual(
+            leak_count,
+            0,
+            f"Found {leak_count} nonzero pixels in identity_protection region of edge_mask!",
+        )
+
+    def test_boundary_band_morphological_close_merges_fragments(self):
+        """
+        Regression test: boundary_band on fine-strand / curly hair with micro-gaps
+        is closed into a contiguous repaintable band instead of fragmented micro-islands.
+        """
+        h, w = 100, 100
+        # Create a curly hair alpha with fine strand gaps (isolated checkerboard holes)
+        alpha = np.zeros((h, w), dtype=np.float32)
+        alpha[20:80, 20:80] = 0.90
+        # Punch isolated 2x2 holes in the boundary region (y in [20, 30])
+        for y in range(22, 30, 3):
+            for x in range(25, 75, 4):
+                alpha[y:y+2, x:x+2] = 0.0
+
+        tgt_hair = np.zeros((h, w), dtype=np.uint8)
+        tgt_hair[25:75, 25:75] = 255
+
+        _, edge_mask = build_edge_repair_mask(
+            aligned_hair_alpha=alpha,
+            target_hair_mask_np=tgt_hair,
+            hard_protection=None,
+            target_shape=(h, w),
+            edge_width_px=8,
+            donor_coverage_threshold=0.85,
+        )
+
+        # In the punctured boundary region, the morphological close and hole filling
+        # should produce a solid, contiguous band without isolated single-pixel zeros
+        punched_region = edge_mask[22:28, 30:70]
+        # Should be predominantly 255 (contiguous seam), not fragmented zeros
+        fill_ratio = np.count_nonzero(punched_region) / punched_region.size
+        self.assertGreater(fill_ratio, 0.95, f"Boundary seam remains fragmented: fill_ratio={fill_ratio:.2f}")
 
 
 if __name__ == "__main__":

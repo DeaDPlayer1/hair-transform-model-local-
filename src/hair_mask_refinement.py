@@ -27,13 +27,15 @@ CLOTHING_SEG_CLASSES = [16]
 def refine_reference_hair_mask(
     reference_rgb: np.ndarray,
     reference_hair_mask: np.ndarray,
+    landmarks_dict: Optional[Dict[str, Any]] = None,
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
     """
     Prune studio-backdrop pixels that the hair parser labeled as hair.
 
-    Keeps real interior highlights (small enclosed backdrop-like blobs) and
-    dark hair. Removes large curl-gap pockets and perimeter fringe that match
-    the studio backdrop. Does not globally strip bright pixels.
+    Keeps real interior highlights and dark/light hair. Removes large curl-gap
+    pockets and perimeter backdrop fringe. Strictly protects core hair around
+    the skull from being pruned, and prevents excessive pruning from destroying
+    the reference hairstyle when background colors vary.
     """
     ref_rgb = reference_rgb
     ref_hair_np = reference_hair_mask
@@ -42,44 +44,62 @@ def refine_reference_hair_mask(
         ref_hair_np = cv2.resize(ref_hair_np, (w_r, h_r), interpolation=cv2.INTER_NEAREST)
 
     hair = ref_hair_np > 128
-    border_px = max(10, int(round(15 * (max(h_r, w_r) / 512.0))))
-    top_b = ref_rgb[:border_px, :]
-    left_b = ref_rgb[:, :border_px]
-    right_b = ref_rgb[:, -border_px:]
-    perim_rgb = np.concatenate(
-        [top_b.reshape(-1, 3), left_b.reshape(-1, 3), right_b.reshape(-1, 3)], axis=0
-    )
-    perim_hair = np.concatenate(
-        [
-            hair[:border_px].reshape(-1),
-            hair[:, :border_px].reshape(-1),
-            hair[:, -border_px:].reshape(-1),
-        ]
-    )
-    bg_perim = perim_rgb[~perim_hair]
-    if len(bg_perim) > 30:
-        backdrop_color = np.median(bg_perim, axis=0)
-        backdrop_std = float(np.std(bg_perim, axis=0).max())
+
+    # 1. Sample backdrop specifically from TOP CORNERS (above shoulders and clothing)
+    c_w = max(10, int(w_r * 0.12))
+    c_h = max(10, int(h_r * 0.12))
+
+    tl = ref_rgb[:c_h, :c_w]
+    tr = ref_rgb[:c_h, -c_w:]
+    corners = np.concatenate([tl.reshape(-1, 3), tr.reshape(-1, 3)], axis=0)
+
+    # Exclude any hair pixels in corners
+    tl_hair = hair[:c_h, :c_w]
+    tr_hair = hair[:c_h, -c_w:]
+    corners_hair = np.concatenate([tl_hair.reshape(-1), tr_hair.reshape(-1)], axis=0)
+
+    bg_corners = corners[~corners_hair] if np.any(~corners_hair) else corners
+    if len(bg_corners) < 20:
+        top_slice = ref_rgb[:max(5, int(h_r * 0.03)), :].reshape(-1, 3)
+        top_hair = hair[:max(5, int(h_r * 0.03)), :].reshape(-1)
+        bg_corners = top_slice[~top_hair] if np.any(~top_hair) else top_slice
+
+    backdrop_color = np.median(bg_corners, axis=0)
+    backdrop_std = float(np.std(bg_corners, axis=0).max())
+
+    # Bound prune threshold strictly:
+    # If backdrop_std is high (>35), the backdrop is non-uniform, so use a very tight conservative threshold
+    if backdrop_std > 35.0:
+        prune_threshold = 24.0
     else:
-        corners = np.concatenate([ref_rgb[:25, :25], ref_rgb[:25, -25:]], axis=1)
-        backdrop_color = corners.mean(axis=(0, 1))
-        backdrop_std = float(corners.std(axis=(0, 1)).max())
+        prune_threshold = float(np.clip(backdrop_std * 2.2, 18.0, 42.0))
 
     color_dist = np.linalg.norm(ref_rgb.astype(np.float32) - backdrop_color, axis=-1)
-    prune_threshold = max(24.0, backdrop_std * 3.5)
     is_backdrop = color_dist < prune_threshold
 
+    # Core hair: erosion of hair mask around the upper head
     hair_u8 = hair.astype(np.uint8)
-    core_deep_k = max(5, int(round(7 * (max(h_r, w_r) / 512.0))))
+    core_deep_k = max(5, int(round(9 * (max(h_r, w_r) / 512.0))))
     if core_deep_k % 2 == 0:
         core_deep_k += 1
     hair_core_deep = cv2.erode(
         hair_u8, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (core_deep_k, core_deep_k))
     )
 
+    # Identify head region from landmarks if available
+    head_core_y = int(h_r * 0.5)
+    if landmarks_dict is not None and landmarks_dict.get("landmarks_2d") is not None:
+        pts = landmarks_dict["landmarks_2d"]
+        try:
+            if len(pts) > 0:
+                head_core_y = int(min(pt[1] for pt in pts))
+        except (TypeError, ValueError):
+            pass
+
+    # Connected components of hair pixels matching backdrop color
     backdrop_hair = (hair & is_backdrop).astype(np.uint8)
     n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(backdrop_hair, connectivity=8)
-    highlight_max = max(16, int(round(48.0 * ((max(h_r, w_r) / 512.0) ** 2))))
+    highlight_max = max(16, int(round(64.0 * ((max(h_r, w_r) / 512.0) ** 2))))
 
     prune_mask = np.zeros((h_r, w_r), dtype=bool)
     for i in range(1, n_labels):
@@ -88,19 +108,34 @@ def refine_reference_hair_mask(
         y = int(stats[i, cv2.CC_STAT_TOP])
         bw = int(stats[i, cv2.CC_STAT_WIDTH])
         bh = int(stats[i, cv2.CC_STAT_HEIGHT])
-        touches_border = x <= 0 or y <= 0 or (x + bw) >= w_r or (y + bh) >= h_r
-        component = labels == i
-        in_deep_core = bool(np.any(hair_core_deep[component] > 0))
-        # Keep only tiny interior highlight specks; prune fringe and large pockets.
+        touches_border = (x <= 0 or y <= 0 or (x + bw) >= w_r)
+        comp = (labels == i)
+
+        in_deep_core = bool(np.any(hair_core_deep[comp] > 0))
+        # Keep only tiny interior highlight specks; prune perimeter fringe and large backdrop pockets.
         if area <= highlight_max and in_deep_core and not touches_border:
             continue
-        prune_mask[component] = True
+        prune_mask[comp] = True
+
+    # Sanity guard: Pruning should NEVER wipe out more than 35% of the total hair mask
+    total_hair_px = np.count_nonzero(hair)
+    pruned_px = np.count_nonzero(prune_mask)
+    if total_hair_px > 0 and (pruned_px / total_hair_px) > 0.35:
+        # Fallback: only prune pixels that are on the outer perimeter (outer 3% border)
+        border_margin = max(3, int(min(w_r, h_r) * 0.03))
+        perimeter_mask = np.zeros((h_r, w_r), dtype=bool)
+        perimeter_mask[:border_margin, :] = True
+        perimeter_mask[:, :border_margin] = True
+        perimeter_mask[:, -border_margin:] = True
+        prune_mask = prune_mask & perimeter_mask
 
     cleaned = ref_hair_np.copy()
     cleaned[prune_mask] = 0
     info = {
         "pruned_count": int(np.count_nonzero(prune_mask)),
         "backdrop_color": backdrop_color,
+        "backdrop_std": backdrop_std,
+        "prune_threshold": prune_threshold,
         "is_backdrop": is_backdrop,
         "prune_mask": prune_mask,
     }

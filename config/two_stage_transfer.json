@@ -1,0 +1,31 @@
+{
+  "stage1": {
+    "backend": "auto",
+    "num_inference_steps": 8,
+    "guidance_scale": 7.5,
+    "hair_mask_expansion_ratio": 0.01,
+    "max_hair_mask_expansion_px": 12,
+    "feather_width_px": 2.0,
+    "prompt": "Photorealistic portrait of the same person with naturally bald, clean scalp skin. Preserve the exact facial identity, forehead proportions, eyebrows, eyes, ears, expression, lighting, camera angle, clothing and background.",
+    "negative_prompt": "hair, loose hair strands, wig, hair cap, distorted scalp, changed face, changed eyebrows, changed eyes, altered ears, deformed forehead, blurry skin, artificial skin, artifacts"
+  },
+  "stage2": {
+    "num_inference_steps": 8,
+    "guidance_scale": 7.5,
+    "ip_adapter_scale": 0.75,
+    "cranial_expansion_px": 30,
+    "feather_width_px": 6.0,
+    "hairline_transition_px": 15,
+    "donor_coverage_threshold": 0.85,
+    "seed": 42
+  },
+  "controlnet": {
+    "enabled": "auto",
+    "model_path": null
+  },
+  "safety": {
+    "preserve_original_outside_hair_envelope": true,
+    "preserve_identity_pixels": true,
+    "fail_on_invalid_model_output": true
+  }
+}

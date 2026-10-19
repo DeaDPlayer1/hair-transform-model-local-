@@ -1,0 +1,20 @@
+{
+  "timestamp": "2026-10-19 15:34:45",
+  "iteration": "iteration_002",
+  "total_evaluated": 1,
+  "total_passed": 1,
+  "total_needs_review": 0,
+  "total_failed": 0,
+  "best_results": [
+    {
+      "pair_id": "pair_01_target3_x_reference1",
+      "status": "PASS",
+      "final_composite": "outputs/robustness_campaign/iteration_002/pair_runs/pair_01_target3_x_reference1/final_composite.png",
+      "comparison_collage": "outputs/robustness_campaign/iteration_002/pair_runs/pair_01_target3_x_reference1/comparison_collage.png",
+      "bald_base": "outputs/robustness_campaign/iteration_002/pair_runs/pair_01_target3_x_reference1/bald_base.png",
+      "aligned_composite_before_diffusion": "outputs/robustness_campaign/iteration_002/pair_runs/pair_01_target3_x_reference1/aligned_composite_before_diffusion.png",
+      "outside_preservation_pct": 100.0,
+      "duration_seconds": 273.8
+    }
+  ]
+}
