@@ -48,6 +48,7 @@ scripts/diagnose_*.py
 scripts/generate_*.py
 scripts/run_*.py
 !scripts/run_robustness_campaign.py
+!scripts/run_stage1_generalization.py
 scripts/test_ear_*.py
 scripts/test_isolated_*.py
 scripts/test_targeted_*.py
@@ -62,6 +63,7 @@ outputs/pair2_generation/
 outputs/my_hairstyle_test/
 outputs/my_random_test_*/
 outputs/debug_overlays/
+outputs/stage1_generalization/
 outputs/test_*/
 outputs/test_*
 models/bald_converter/

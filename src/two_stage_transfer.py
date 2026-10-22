@@ -293,13 +293,16 @@ def generate_two_stage_hairstyle_transfer(
         exp_dir.mkdir(parents=True, exist_ok=True)
         exp_dir_path = str(exp_dir.resolve())
 
+        target_img_rgb.save(exp_dir / "target_original.png")
         target_img_rgb.save(exp_dir / "input_target.png")
         target_hair_mask_clean.save(exp_dir / "target_hair_mask.png")
         stage1_edit_mask.save(exp_dir / "stage1_edit_mask.png")
+        stage1_protection_mask.save(exp_dir / "strict_identity_protection.png")
         stage1_protection_mask.save(exp_dir / "stage1_protection_mask.png")
         if stage1_removal_overlay:
             stage1_removal_overlay.save(exp_dir / "stage1_removal_overlay.png")
         if stage1_headwear_mask:
+            stage1_headwear_mask.save(exp_dir / "headwear_mask.png")
             stage1_headwear_mask.save(exp_dir / "stage1_headwear_mask.png")
         if stage1_raw_generated:
             stage1_raw_generated.save(exp_dir / "stage1_raw_generated.png")
@@ -314,9 +317,12 @@ def generate_two_stage_hairstyle_transfer(
             "stage1_seed": final_seed,
             "headwear_detected": s1_result.headwear_detected,
             "duration_seconds": s1_duration,
+            "stage1_details": s1_result.metadata,
         }
         with (exp_dir / "metadata.json").open("w", encoding="utf-8") as f:
             json.dump(s1_metadata, f, indent=2)
+        with (exp_dir / "stage1_metrics.json").open("w", encoding="utf-8") as f:
+            json.dump(s1_result.metadata, f, indent=2)
         with (exp_dir / "warnings.json").open("w", encoding="utf-8") as f:
             json.dump(warnings, f, indent=2)
 
