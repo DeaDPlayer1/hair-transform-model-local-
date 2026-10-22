@@ -67,7 +67,7 @@ def parse_args():
         "--reference",
         "-r",
         type=str,
-        required=True,
+        default=None,
         help="Path to the hairstyle reference image (e.g. 'assets/hair reference.jpg' or path/to/ref.jpg)",
     )
     parser.add_argument(
@@ -76,6 +76,22 @@ def parse_args():
         type=str,
         default="outputs/two_stage_runs",
         help="Output directory (default: outputs/two_stage_runs)",
+    )
+    parser.add_argument(
+        "--stage1-only",
+        action="store_true",
+        help="Run Stage 1 only (bald conversion and scalp generation) and exit before Stage 2",
+    )
+    parser.add_argument(
+        "--headwear-mask",
+        type=str,
+        default=None,
+        help="Optional path to custom or manual headwear / stage 1 removal mask",
+    )
+    parser.add_argument(
+        "--no-detect-headwear",
+        action="store_true",
+        help="Disable automatic headwear detector fallback",
     )
     parser.add_argument(
         "--stage1-backend",
@@ -87,8 +103,8 @@ def parse_args():
     parser.add_argument(
         "--stage1-steps",
         type=int,
-        default=8,
-        help="Stage 1 diffusion inference steps (default: 8)",
+        default=12,
+        help="Stage 1 diffusion inference steps (default: 12)",
     )
     parser.add_argument(
         "--stage2-steps",
@@ -133,42 +149,48 @@ def main():
     args = parse_args()
 
     target_path = resolve_image_path(args.target)
-    ref_path = resolve_image_path(args.reference)
+    ref_path = resolve_image_path(args.reference) if args.reference else None
 
     if not target_path.is_file():
         print(f"\n[ERROR] Target image file not found: '{args.target}' (resolved: '{target_path}')")
         sys.exit(1)
-    if not ref_path.is_file():
-        print(f"\n[ERROR] Reference image file not found: '{args.reference}' (resolved: '{ref_path}')")
+
+    if not args.stage1_only and (ref_path is None or not ref_path.is_file()):
+        print(f"\n[ERROR] Reference image required for full two-stage run: '{args.reference}'")
         sys.exit(1)
 
     print("\n========================================================")
     print("  HairTryOn — Two-Stage Hairstyle Transfer Pipeline")
     print("========================================================")
     print(f"Target path:         {target_path}")
-    print(f"Reference path:      {ref_path}")
+    print(f"Reference path:      {ref_path if ref_path else '(None - Stage 1 only)'}")
     print(f"Output directory:    {args.output_dir}")
+    print(f"Stage 1 only:        {args.stage1_only}")
+    print(f"Headwear mask:       {args.headwear_mask}")
+    print(f"Detect headwear:     {not args.no_detect_headwear}")
     print(f"Stage 1 backend:     {args.stage1_backend}")
     print(f"Stage 1 steps:       {args.stage1_steps}")
-    print(f"Stage 2 steps:       {args.stage2_steps}")
-    print(f"IP-Adapter scale:    {args.scale}")
+    if not args.stage1_only:
+        print(f"Stage 2 steps:       {args.stage2_steps}")
+        print(f"IP-Adapter scale:    {args.scale}")
     print(f"Guidance scale:      {args.guidance_scale}")
     print(f"Seed:                {args.seed}")
     print(f"ControlNet:          {args.controlnet}\n")
 
     # 1. Load images and check dimensions
-    print("[1/5] Loading target and reference images...")
+    print("[1/5] Loading target image...")
     try:
         target_img = Image.open(target_path).convert("RGB")
-        ref_img = Image.open(ref_path).convert("RGB")
+        ref_img = Image.open(ref_path).convert("RGB") if ref_path else None
     except Exception as e:
-        print(f"[ERROR] Failed to read input images: {e}")
+        print(f"[ERROR] Failed to read input image: {e}")
         sys.exit(1)
 
     w_t, h_t = target_img.size
-    w_r, h_r = ref_img.size
     print(f"      Target dimensions:    {w_t}x{h_t}")
-    print(f"      Reference dimensions: {w_r}x{h_r}")
+    if ref_img:
+        w_r, h_r = ref_img.size
+        print(f"      Reference dimensions: {w_r}x{h_r}")
 
     # 2. Run segmentation and hair mask analysis
     print("[2/5] Segmenting hair masks and facial landmarks...")
@@ -176,32 +198,36 @@ def main():
     target_hair_mask = t_seg_res[0]
     target_seg_map = t_seg_res[4]
 
-    r_seg_res = app_segment_hair(ref_img, return_seg_map=True)
-    ref_hair_mask = r_seg_res[0]
+    ref_hair_mask = None
+    if ref_img:
+        r_seg_res = app_segment_hair(ref_img, return_seg_map=True)
+        ref_hair_mask = r_seg_res[0]
+        ref_hair_np = np.asarray(ref_hair_mask.convert("L"))
+        ref_cov = (np.count_nonzero(ref_hair_np > 128) / (w_r * h_r)) * 100.0
+        print(f"      Reference hair coverage: {ref_cov:.2f}% ({np.count_nonzero(ref_hair_np > 128)} px)")
 
     tgt_hair_np = np.asarray(target_hair_mask.convert("L"))
     tgt_cov = (np.count_nonzero(tgt_hair_np > 128) / (w_t * h_t)) * 100.0
     print(f"      Target hair coverage:    {tgt_cov:.2f}% ({np.count_nonzero(tgt_hair_np > 128)} px)")
 
-    ref_hair_np = np.asarray(ref_hair_mask.convert("L"))
-    ref_cov = (np.count_nonzero(ref_hair_np > 128) / (w_r * h_r)) * 100.0
-    print(f"      Reference hair coverage: {ref_cov:.2f}% ({np.count_nonzero(ref_hair_np > 128)} px)")
-
     tgt_bgr = cv2.cvtColor(np.asarray(target_img), cv2.COLOR_RGB2BGR)
-    ref_bgr = cv2.cvtColor(np.asarray(ref_img), cv2.COLOR_RGB2BGR)
     target_lms = detect_face_landmarks(tgt_bgr)
-    ref_lms = detect_face_landmarks(ref_bgr)
     print(f"      Target landmarks:    {'Detected' if target_lms.get('detected') else 'Not detected'}")
-    print(f"      Reference landmarks: {'Detected' if ref_lms.get('detected') else 'Not detected'}")
+
+    ref_lms = None
+    if ref_img:
+        ref_bgr = cv2.cvtColor(np.asarray(ref_img), cv2.COLOR_RGB2BGR)
+        ref_lms = detect_face_landmarks(ref_bgr)
+        print(f"      Reference landmarks: {'Detected' if ref_lms.get('detected') else 'Not detected'}")
 
     # 3. Load generative pipeline once
-    print("[3/5] Loading generative pipeline (SD 1.5 + IP-Adapter Plus)...")
+    print("[3/5] Loading generative pipeline (SD 1.5)...")
     t_pipe = time.perf_counter()
     pipeline = load_local_generative_pipeline()
     print(f"      Pipeline ready in {time.perf_counter() - t_pipe:.1f}s")
 
     # 4. Execute Two-Stage Generation
-    print("\n[4/5] Executing Two-Stage Hairstyle Transfer...")
+    print("\n[4/5] Executing Generation Pipeline...")
     print(f"      -> Running Stage 1: Bald conversion (backend={args.stage1_backend}, steps={args.stage1_steps})...")
     res = generate_two_stage_hairstyle_transfer(
         target_image=target_img,
@@ -219,9 +245,25 @@ def main():
         guidance_scale=args.guidance_scale,
         seed=args.seed,
         use_controlnet=args.controlnet,
+        stage1_only=args.stage1_only,
+        headwear_mask=args.headwear_mask,
+        detect_headwear=(not args.no_detect_headwear),
         save_experiment=(not args.no_save_experiment),
         output_dir=args.output_dir,
     )
+
+    if args.stage1_only:
+        print("\n[5/5] Stage 1 Bald Conversion Complete (stage1_only=True)!")
+        if res.get("experiment_dir"):
+            exp_d = Path(res["experiment_dir"])
+            print(f"\nSaved Stage 1 Artifacts in: {exp_d}")
+            print(f"  • Bald Base:           {exp_d / 'bald_base.png'}")
+            print(f"  • Removal Overlay:     {exp_d / 'stage1_removal_overlay.png'}")
+            print(f"  • Stage 1 Edit Mask:   {exp_d / 'stage1_edit_mask.png'}")
+            print(f"  • Protection Mask:     {exp_d / 'stage1_protection_mask.png'}")
+            print(f"  • Raw Generated Scalp: {exp_d / 'stage1_raw_generated.png'}")
+        print("========================================================\n")
+        return
 
     metrics = res["metrics"]
     metadata = res["metadata"]
@@ -245,6 +287,7 @@ def main():
         print(f"  • Final Output:         {Path(res['experiment_dir']) / 'final_composite.png'}")
         print(f"  • 5-Panel Collage:      {Path(res['experiment_dir']) / 'comparison_collage.png'}")
         print(f"  • Stage 1 Bald Base:    {Path(res['experiment_dir']) / 'bald_base.png'}")
+        print(f"  • Removal Overlay:      {Path(res['experiment_dir']) / 'stage1_removal_overlay.png'}")
         print(f"  • Pre-Diffusion Comp:   {Path(res['experiment_dir']) / 'aligned_composite_before_diffusion.png'}")
     print("========================================================\n")
 

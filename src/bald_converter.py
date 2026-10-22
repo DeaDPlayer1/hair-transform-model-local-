@@ -20,11 +20,13 @@ import cv2
 import numpy as np
 from PIL import Image
 
+from src.headwear_detection import detect_headwear, create_removal_overlay
+
 logger = logging.getLogger(__name__)
 
-# Face parsing segmentation classes for strict protection
-# 2: skin, 3: l_eyebrow, 4: r_eyebrow, 5: l_eye, 6: r_eye, 7: l_ear, 8: r_ear
-# 10: nose, 11: upper_lip, 12: lower_lip, 13: mouth, 16: cloth
+# Face parsing segmentation classes for strict protection:
+# 2: l_eyebrow, 3: r_eyebrow, 4: l_eye, 5: r_eye, 6: glasses, 7: l_ear, 8: r_ear
+# 10: nose, 11: mouth, 12: upper_lip, 13: lower_lip, 16: cloth
 STRICT_PROTECTION_CLASSES = (2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 16)
 EAR_CLASSES = (7, 8)
 
@@ -34,22 +36,24 @@ class BaldConverterConfig:
     """Configuration parameters for Stage 1 bald/scalp reconstruction."""
 
     backend: str = "auto"  # 'auto', 'sd-inpaint', or 'onnx'
-    num_inference_steps: int = 8
+    num_inference_steps: int = 12
     guidance_scale: float = 7.5
-    hair_mask_expansion_ratio: float = 0.01
-    max_hair_mask_expansion_px: int = 12
-    feather_width_px: float = 2.0
+    hair_mask_expansion_ratio: float = 0.008
+    max_hair_mask_expansion_px: int = 10
+    feather_width_px: float = 3.0
     prompt: str = (
-        "Photorealistic portrait of the same person with naturally bald, clean scalp skin. "
-        "Preserve the exact facial identity, forehead proportions, eyebrows, eyes, ears, "
-        "expression, lighting, camera angle, clothing and background."
+        "Photorealistic portrait of the same person, clean smooth bald head, shaved bald head, "
+        "completely bald scalp, natural scalp skin, smooth skin on top of head, shaved bald hairstyle. "
+        "Clean neutral wall background, natural lighting, hyperrealistic, high resolution."
     )
     negative_prompt: str = (
-        "hair, loose hair strands, wig, hair cap, distorted scalp, changed face, "
-        "changed eyebrows, changed eyes, altered ears, deformed forehead, blurry skin, "
-        "artificial skin, artifacts"
+        "hair, stubble, bangs, fringe, hat, cap, baseball cap, beanie, helmet, headwear, "
+        "wig, toupee, fuzzy hair, curly hair, long hair, hair strands, texture, distorted, blurry, "
+        "deformed forehead, artifacts, colorful, purple"
     )
     onnx_model_path: Optional[str] = None
+    headwear_mask_path: Optional[str] = None
+    detect_headwear: bool = True
     seed: int = 42
 
     @classmethod
@@ -65,6 +69,8 @@ class BaldConverterConfig:
             "prompt",
             "negative_prompt",
             "onnx_model_path",
+            "headwear_mask_path",
+            "detect_headwear",
             "seed",
         }
         filtered = {k: v for k, v in data.items() if k in valid_keys}
@@ -88,6 +94,9 @@ class BaldConversionResult:
     edit_mask: Image.Image
     protection_mask: Image.Image
     raw_generated: Optional[Image.Image] = None
+    removal_overlay: Optional[Image.Image] = None
+    headwear_mask: Optional[Image.Image] = None
+    headwear_detected: bool = False
     metadata: Dict[str, Any] = field(default_factory=dict)
     warnings: List[str] = field(default_factory=list)
 
@@ -105,9 +114,10 @@ class BaldConverter(ABC):
         target_hair_mask: Image.Image,
         target_segmentation_map: Optional[np.ndarray] = None,
         face_landmarks: Optional[Dict[str, Any]] = None,
+        headwear_mask: Optional[Union[str, Path, Image.Image, np.ndarray]] = None,
         seed: Optional[int] = None,
     ) -> BaldConversionResult:
-        """Perform hair removal and scalp generation."""
+        """Perform hair and headwear removal and scalp generation."""
         pass
 
     def build_bald_edit_mask(
@@ -116,21 +126,29 @@ class BaldConverter(ABC):
         target_hair_mask: Image.Image,
         target_segmentation_map: Optional[np.ndarray] = None,
         face_landmarks: Optional[Dict[str, Any]] = None,
-    ) -> Tuple[Image.Image, Image.Image, List[str]]:
+        headwear_mask: Optional[Union[str, Path, Image.Image, np.ndarray]] = None,
+        return_extended: bool = False,
+    ) -> Union[
+        Tuple[Image.Image, Image.Image, Image.Image, Any, List[str]],
+        Tuple[Image.Image, Image.Image, List[str]],
+    ]:
         """
-        Construct the Stage 1 edit mask with scale-aware margin and strict feature protection.
+        Construct the Stage 1 edit mask with scale-aware margin, headwear detection,
+        and strict facial feature protection without carving out forehead bangs/fringe.
 
         Returns:
-            edit_mask_pil: Editable region (255 = inpaint scalp, 0 = protected)
-            protection_mask_pil: Strict facial/feature protection mask (255 = protected)
-            warnings: Diagnostic warnings if masks required adjustment
+            If return_extended=True:
+                edit_mask_pil, protection_mask_pil, removal_overlay_pil, hw_result, warnings
+            If return_extended=False:
+                edit_mask_pil, protection_mask_pil, warnings
         """
         warnings: List[str] = []
         w, h = target_image.size
+
+        # 1. Base hair mask binarization
         hair_np = np.asarray(target_hair_mask.convert("L"))
         if hair_np.shape[:2] != (h, w):
             hair_np = cv2.resize(hair_np, (w, h), interpolation=cv2.INTER_NEAREST)
-
         hair_binary = (hair_np > 128).astype(np.uint8) * 255
         hair_px = int(np.count_nonzero(hair_binary))
         total_px = h * w
@@ -138,56 +156,105 @@ class BaldConverter(ABC):
         if hair_px == 0:
             warnings.append("Target hair mask contains 0 active pixels; target may already be bald.")
         elif (hair_px / total_px) > 0.85:
-            warnings.append(f"Target hair mask covers {(hair_px/total_px)*100:.1f}% of image, which is unusually large.")
+            warnings.append(f"Target hair mask covers {(hair_px/total_px)*100:.1f}% of image.")
 
-        # 1. Scale-aware expansion margin for hair boundary
+        # 2. Headwear detection (Class 18 ONNX + compatible heuristic + manual mask)
+        manual_hw = headwear_mask if headwear_mask is not None else self.config.headwear_mask_path
+        hw_result = detect_headwear(
+            image=target_image,
+            seg_map=target_segmentation_map,
+            face_landmarks=face_landmarks,
+            hair_mask=target_hair_mask,
+            manual_mask=manual_hw,
+            enable_heuristic=self.config.detect_headwear,
+        )
+        if hw_result.warnings:
+            warnings.extend(hw_result.warnings)
+
+        hw_np = np.asarray(hw_result.headwear_mask.convert("L"))
+        if hw_np.shape[:2] != (h, w):
+            hw_np = cv2.resize(hw_np, (w, h), interpolation=cv2.INTER_NEAREST)
+        hw_binary = (hw_np > 128).astype(np.uint8) * 255
+
+        if hw_result.detected:
+            warnings.append(
+                f"Headwear detected via '{hw_result.source}' covering {hw_result.pixel_count} px ({hw_result.coverage_pct:.2f}%)."
+            )
+
+        # Combine hair + headwear into complete removal target
+        combined_removal = np.maximum(hair_binary, hw_binary)
+
+        # 3. Scale-aware expansion margin (ensures outer flyaways and silhouette edges are covered)
         expansion_px = max(
-            1,
+            4,
             min(
                 self.config.max_hair_mask_expansion_px,
                 int(round(max(w, h) * self.config.hair_mask_expansion_ratio)),
             ),
         )
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (expansion_px * 2 + 1, expansion_px * 2 + 1))
-        expanded_hair = cv2.dilate(hair_binary, kernel, iterations=1)
+        expanded_removal = cv2.dilate(combined_removal, kernel, iterations=1)
 
-        # 2. Strict Protection Mask
-        protection = np.zeros((h, w), dtype=np.uint8)
+        # 4. Strict Facial Feature Protection (eyebrows, eyes, nose, mouth, ears, clothing)
+        # Eyebrows (classes 2, 3), Eyes (4, 5, 6), Ears (7, 8), Nose (10), Lips/Mouth (11, 12, 13), Cloth (16)
+        vital_protection = np.zeros((h, w), dtype=np.uint8)
 
-        # Segmented facial features (ears, eyes, brows, nose, mouth, clothing)
         if target_segmentation_map is not None:
             seg_map = target_segmentation_map
             if seg_map.shape[:2] != (h, w):
                 seg_map = cv2.resize(seg_map, (w, h), interpolation=cv2.INTER_NEAREST)
-            features_mask = np.isin(seg_map, STRICT_PROTECTION_CLASSES).astype(np.uint8) * 255
-            protection = np.maximum(protection, features_mask)
 
-        # Landmark facial hull protection
+            # Features: eyebrows, eyes, ears, nose, mouth, clothing
+            features_mask = np.isin(seg_map, STRICT_PROTECTION_CLASSES).astype(np.uint8) * 255
+            # Dilate delicate eyebrows and eyes into skin only (never into hair/fringe)
+            eyebrows_eyes = np.isin(seg_map, (2, 3, 4, 5, 6)).astype(np.uint8) * 255
+            eyebrows_eyes_dilated = cv2.dilate(eyebrows_eyes, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)))
+            eyebrows_eyes_safe = eyebrows_eyes_dilated & (~combined_removal)
+            vital_protection = np.maximum(features_mask, eyebrows_eyes_safe)
+
+        # 5. Lower face hull protection (protect cheeks, chin, jawline below eyebrow level)
+        # CRITICAL: We do NOT include the upper forehead in this protection hull, because
+        # doing so would carve out forehead bangs/fringe and leave them behind!
+        lower_face_mask = np.zeros((h, w), dtype=np.uint8)
         if face_landmarks and face_landmarks.get("detected"):
             landmarks_2d = face_landmarks.get("landmarks_2d", [])
             if len(landmarks_2d) >= 10:
                 pts = np.array(landmarks_2d, dtype=np.int32)
-                # Keep convex hull bounded strictly within image
-                hull = cv2.convexHull(pts)
-                hull_mask = np.zeros((h, w), dtype=np.uint8)
-                cv2.fillConvexPoly(hull_mask, hull, 255)
-                protection = np.maximum(protection, hull_mask)
+                # Eyebrow landmark points to establish horizontal divide
+                eyebrow_indices = [70, 63, 105, 66, 107, 336, 296, 334, 293, 300]
+                valid_idx = [i for i in eyebrow_indices if i < len(pts)]
+                if valid_idx:
+                    eyebrow_pts = pts[valid_idx]
+                    min_brow_y = int(np.min(eyebrow_pts[:, 1]))
+                    # Lower face: landmarks at or below eyebrow level minus 4px safety buffer
+                    lower_pts = pts[pts[:, 1] >= (min_brow_y - 4)]
+                    if len(lower_pts) >= 6:
+                        lower_hull = cv2.convexHull(lower_pts)
+                        cv2.fillConvexPoly(lower_face_mask, lower_hull, 255)
 
-        # 3. Construct editable region: expanded hair minus strict facial features
-        editable = expanded_hair.copy()
-        editable[protection > 0] = 0
+        # Lower face skin is protected, but hair/fringe/cap itself is allowed to be edited
+        # unless it directly touches vital features (eyebrows/eyes/lips/ears/cloth)
+        protection = np.maximum(vital_protection, lower_face_mask & (~combined_removal))
 
-        # Optional hole filling so scalp inpainting is contiguous
+        # 6. Construct Editable Region: expanded removal minus strict protection
+        editable = expanded_removal.copy()
+        editable[vital_protection > 0] = 0
+
+        # Fill small holes inside editable hair/headwear region for contiguous scalp synthesis
         if np.any(editable > 0):
             flood = editable.copy()
             flood_mask = np.zeros((h + 2, w + 2), np.uint8)
             cv2.floodFill(flood, flood_mask, (0, 0), 255)
             inv_flood = cv2.bitwise_not(flood)
             editable = (editable | inv_flood)
-            editable[protection > 0] = 0
+            editable[vital_protection > 0] = 0
 
         edit_mask_pil = Image.fromarray(editable, mode="L")
         protection_mask_pil = Image.fromarray(protection, mode="L")
+        removal_overlay_pil = create_removal_overlay(target_image, edit_mask_pil, color=(255, 30, 30), alpha=0.50)
+
+        if return_extended:
+            return edit_mask_pil, protection_mask_pil, removal_overlay_pil, hw_result, warnings
         return edit_mask_pil, protection_mask_pil, warnings
 
 
@@ -212,19 +279,24 @@ class SDInpaintBaldConverter(BaldConverter):
         target_hair_mask: Image.Image,
         target_segmentation_map: Optional[np.ndarray] = None,
         face_landmarks: Optional[Dict[str, Any]] = None,
+        headwear_mask: Optional[Union[str, Path, Image.Image, np.ndarray]] = None,
         seed: Optional[int] = None,
     ) -> BaldConversionResult:
         t0 = time.perf_counter()
         w_orig, h_orig = target_image.size
         run_seed = seed if seed is not None else self.config.seed
 
-        # Step 1: Construct edit and protection masks
-        edit_mask_pil, protection_mask_pil, warnings = self.build_bald_edit_mask(
-            target_image=target_image,
-            target_hair_mask=target_hair_mask,
-            target_segmentation_map=target_segmentation_map,
-            face_landmarks=face_landmarks,
-        )
+        # Step 1: Construct edit and protection masks with headwear and fringe coverage
+        edit_mask_pil, protection_mask_pil, removal_overlay_pil, hw_result, warnings = (
+            self.build_bald_edit_mask(
+                target_image=target_image,
+                target_hair_mask=target_hair_mask,
+                target_segmentation_map=target_segmentation_map,
+                face_landmarks=face_landmarks,
+                headwear_mask=headwear_mask,
+                return_extended=True,
+            )
+        )       
 
         edit_np = np.asarray(edit_mask_pil)
         if np.count_nonzero(edit_np) == 0:
@@ -234,6 +306,9 @@ class SDInpaintBaldConverter(BaldConverter):
                 edit_mask=edit_mask_pil,
                 protection_mask=protection_mask_pil,
                 raw_generated=target_image.copy(),
+                removal_overlay=removal_overlay_pil,
+                headwear_mask=hw_result.headwear_mask,
+                headwear_detected=hw_result.detected,
                 metadata={
                     "backend": "sd-inpaint",
                     "status": "skipped_empty_mask",
@@ -249,30 +324,57 @@ class SDInpaintBaldConverter(BaldConverter):
         pipe_mask_img = edit_mask_pil.resize((512, 512), Image.Resampling.NEAREST)
 
         import torch
+        from diffusers import DDIMScheduler
 
         device = "cpu"
         if hasattr(pipe, "device") and isinstance(getattr(pipe, "device"), (str, torch.device)):
             device = pipe.device
         generator = torch.Generator(device=device).manual_seed(run_seed)
 
-        # Set IP-Adapter scale to 0.0 for Stage 1 bald reconstruction (no hair conditioning)
-        if hasattr(pipe, "set_ip_adapter_scale"):
-            pipe.set_ip_adapter_scale(0.0)
+        # Temporarily unload IP-Adapter to prevent cross-attention artifacts during Stage 1 bald generation
+        was_ip_adapter_loaded = False
+        if hasattr(pipe, "unload_ip_adapter") and hasattr(pipe, "image_encoder") and pipe.image_encoder is not None:
+            try:
+                pipe.unload_ip_adapter()
+                was_ip_adapter_loaded = True
+            except Exception as e:
+                logger.debug(f"Stage 1 IP-Adapter unload skipped: {e}")
+
+        # Use DDIMScheduler for clean, artifact-free inpainting in Stage 1
+        orig_scheduler = getattr(pipe, "scheduler", None)
+        if (
+            orig_scheduler is not None
+            and hasattr(orig_scheduler, "config")
+            and isinstance(orig_scheduler.config, dict)
+        ):
+            pipe.scheduler = DDIMScheduler.from_config(orig_scheduler.config)
 
         pipe_kwargs = {
             "prompt": self.config.prompt,
             "negative_prompt": self.config.negative_prompt,
             "image": pipe_input_img,
             "mask_image": pipe_mask_img,
-            "num_inference_steps": self.config.num_inference_steps,
+            "num_inference_steps": max(10, self.config.num_inference_steps),
             "guidance_scale": self.config.guidance_scale,
             "generator": generator,
         }
-        # If pipeline has IP-Adapter loaded, provide ip_adapter_image to satisfy UNet cross-attention
-        if hasattr(pipe, "image_encoder") and pipe.image_encoder is not None:
-            pipe_kwargs["ip_adapter_image"] = pipe_input_img
 
-        diffusion_output = pipe(**pipe_kwargs)
+        try:
+            diffusion_output = pipe(**pipe_kwargs)
+        finally:
+            # Restore scheduler
+            pipe.scheduler = orig_scheduler
+            # If IP-Adapter was unloaded, reload it for downstream Stage 2 usage
+            if was_ip_adapter_loaded and hasattr(pipe, "load_ip_adapter"):
+                try:
+                    pipe.load_ip_adapter(
+                        "h94/IP-Adapter",
+                        subfolder="models",
+                        weight_name="ip-adapter-plus_sd15.bin",
+                        local_files_only=True,
+                    )
+                except Exception as e:
+                    logger.debug(f"Stage 1 IP-Adapter reload deferred: {e}")
 
         raw_512 = diffusion_output.images[0]
         raw_generated = raw_512.resize((w_orig, h_orig), Image.Resampling.LANCZOS)
@@ -317,6 +419,9 @@ class SDInpaintBaldConverter(BaldConverter):
             "guidance_scale": self.config.guidance_scale,
             "duration_seconds": duration,
             "edit_mask_coverage_pct": (np.count_nonzero(edit_np > 128) / (w_orig * h_orig)) * 100.0,
+            "headwear_detected": hw_result.detected,
+            "headwear_source": hw_result.source,
+            "headwear_pixels": hw_result.pixel_count,
             "dimensions": [w_orig, h_orig],
         }
 
@@ -325,6 +430,9 @@ class SDInpaintBaldConverter(BaldConverter):
             edit_mask=edit_mask_pil,
             protection_mask=protection_mask_pil,
             raw_generated=raw_generated,
+            removal_overlay=removal_overlay_pil,
+            headwear_mask=hw_result.headwear_mask,
+            headwear_detected=hw_result.detected,
             metadata=metadata,
             warnings=warnings,
         )
@@ -375,6 +483,7 @@ class ONNXBaldConverter(BaldConverter):
             target_hair_mask=target_hair_mask,
             target_segmentation_map=target_segmentation_map,
             face_landmarks=face_landmarks,
+            return_extended=False,
         )
 
         # Contract validation on inputs

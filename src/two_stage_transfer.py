@@ -72,9 +72,9 @@ def load_two_stage_config(config_path: Optional[Union[str, Path]] = None) -> Dic
         },
         "controlnet": {"enabled": "auto", "model_path": None},
         "safety": {
-            "preserve_original_outside_hair_envelope": true,
-            "preserve_identity_pixels": true,
-            "fail_on_invalid_model_output": true,
+            "preserve_original_outside_hair_envelope": True,
+            "preserve_identity_pixels": True,
+            "fail_on_invalid_model_output": True,
         },
     }
 
@@ -141,6 +141,9 @@ def generate_two_stage_hairstyle_transfer(
     hairline_transition_px: Optional[int] = None,
     donor_coverage_threshold: Optional[float] = None,
     use_controlnet: str = "auto",
+    stage1_only: bool = False,
+    headwear_mask: Optional[Union[str, Path, Image.Image, np.ndarray]] = None,
+    detect_headwear: bool = True,
     save_experiment: bool = True,
     experiment_id: Optional[str] = None,
     output_dir: Optional[Union[Path, str]] = None,
@@ -163,7 +166,7 @@ def generate_two_stage_hairstyle_transfer(
     s2_cfg = base_cfg.get("stage2", {})
 
     final_s1_backend = stage1_backend if stage1_backend != "auto" else s1_cfg.get("backend", "auto")
-    final_s1_steps = stage1_steps if stage1_steps is not None else s1_cfg.get("num_inference_steps", 8)
+    final_s1_steps = stage1_steps if stage1_steps is not None else s1_cfg.get("num_inference_steps", 12)
     final_s2_steps = stage2_steps if stage2_steps is not None else s2_cfg.get("num_inference_steps", 8)
     final_scale = ip_adapter_scale if ip_adapter_scale is not None else s2_cfg.get("ip_adapter_scale", 0.75)
     final_guidance = guidance_scale if guidance_scale is not None else s2_cfg.get("guidance_scale", 7.5)
@@ -175,7 +178,7 @@ def generate_two_stage_hairstyle_transfer(
 
     # 2. Preprocess & Validate Target & Reference
     target_img_rgb = target_image.convert("RGB")
-    ref_img_rgb = reference_image.convert("RGB")
+    ref_img_rgb = reference_image.convert("RGB") if reference_image is not None else target_img_rgb.copy()
     w_t, h_t = target_img_rgb.size
     w_r, h_r = ref_img_rgb.size
 
@@ -189,11 +192,13 @@ def generate_two_stage_hairstyle_transfer(
         if target_segmentation_map is None:
             target_segmentation_map = t_seg_res[4]
 
-    if reference_hair_mask is None:
+    if not stage1_only and reference_hair_mask is None and reference_image is not None:
         from src.hair_segmentation import segment_hair as app_segment_hair
 
         r_seg_res = app_segment_hair(ref_img_rgb, return_seg_map=True)
         reference_hair_mask = r_seg_res[0]
+    elif reference_hair_mask is None:
+        reference_hair_mask = Image.new("L", (w_r, h_r), 0)
 
     # Facial Landmarks
     if face_landmarks is None:
@@ -202,7 +207,7 @@ def generate_two_stage_hairstyle_transfer(
         tgt_bgr = cv2.cvtColor(np.asarray(target_img_rgb), cv2.COLOR_RGB2BGR)
         face_landmarks = detect_face_landmarks(tgt_bgr)
 
-    if reference_landmarks is None:
+    if not stage1_only and reference_landmarks is None and reference_image is not None:
         from src.face_landmarks import detect_face_landmarks
 
         ref_bgr = cv2.cvtColor(np.asarray(ref_img_rgb), cv2.COLOR_RGB2BGR)
@@ -240,12 +245,14 @@ def generate_two_stage_hairstyle_transfer(
         backend=final_s1_backend,
         num_inference_steps=final_s1_steps,
         guidance_scale=final_guidance,
-        hair_mask_expansion_ratio=s1_cfg.get("hair_mask_expansion_ratio", 0.01),
-        max_hair_mask_expansion_px=s1_cfg.get("max_hair_mask_expansion_px", 12),
-        feather_width_px=s1_cfg.get("feather_width_px", 2.0),
+        hair_mask_expansion_ratio=s1_cfg.get("hair_mask_expansion_ratio", BaldConverterConfig.hair_mask_expansion_ratio),
+        max_hair_mask_expansion_px=s1_cfg.get("max_hair_mask_expansion_px", BaldConverterConfig.max_hair_mask_expansion_px),
+        feather_width_px=s1_cfg.get("feather_width_px", BaldConverterConfig.feather_width_px),
         prompt=s1_cfg.get("prompt", BaldConverterConfig.prompt),
         negative_prompt=s1_cfg.get("negative_prompt", BaldConverterConfig.negative_prompt),
         onnx_model_path=s1_cfg.get("onnx_model_path", None),
+        headwear_mask_path=headwear_mask if isinstance(headwear_mask, (str, Path)) else s1_cfg.get("headwear_mask_path", None),
+        detect_headwear=detect_headwear,
         seed=final_seed,
     )
 
@@ -255,6 +262,7 @@ def generate_two_stage_hairstyle_transfer(
         target_hair_mask=target_hair_mask_clean,
         target_segmentation_map=target_segmentation_map,
         face_landmarks=face_landmarks,
+        headwear_mask=headwear_mask,
         seed=final_seed,
     )
     s1_duration = time.perf_counter() - s1_t0
@@ -262,6 +270,8 @@ def generate_two_stage_hairstyle_transfer(
     bald_base = s1_result.bald_base
     stage1_edit_mask = s1_result.edit_mask
     stage1_protection_mask = s1_result.protection_mask
+    stage1_removal_overlay = s1_result.removal_overlay
+    stage1_headwear_mask = s1_result.headwear_mask
     stage1_raw_generated = s1_result.raw_generated
     if s1_result.warnings:
         warnings.extend(s1_result.warnings)
@@ -271,6 +281,56 @@ def generate_two_stage_hairstyle_transfer(
         raise ValueError(
             f"Stage 1 returned bald base with mismatched size {bald_base.size}, expected {(w_t, h_t)}"
         )
+
+    # If stage1_only requested, save Stage 1 artifacts and exit before Stage 2
+    if stage1_only:
+        logger.info("TwoStageTransfer: Stage 1 complete. Early exit requested via stage1_only=True.")
+        run_tag = experiment_id or datetime.now().strftime("%Y%m%d_%H%M%S")
+        if output_dir:
+            exp_dir = Path(output_dir) / f"{run_tag}"
+        else:
+            exp_dir = Path("outputs/two_stage_runs") / f"{run_tag}"
+        exp_dir.mkdir(parents=True, exist_ok=True)
+        exp_dir_path = str(exp_dir.resolve())
+
+        target_img_rgb.save(exp_dir / "input_target.png")
+        target_hair_mask_clean.save(exp_dir / "target_hair_mask.png")
+        stage1_edit_mask.save(exp_dir / "stage1_edit_mask.png")
+        stage1_protection_mask.save(exp_dir / "stage1_protection_mask.png")
+        if stage1_removal_overlay:
+            stage1_removal_overlay.save(exp_dir / "stage1_removal_overlay.png")
+        if stage1_headwear_mask:
+            stage1_headwear_mask.save(exp_dir / "stage1_headwear_mask.png")
+        if stage1_raw_generated:
+            stage1_raw_generated.save(exp_dir / "stage1_raw_generated.png")
+        bald_base.save(exp_dir / "bald_base.png")
+
+        s1_metadata = {
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "stage": "stage1_only",
+            "target_dimensions": [w_t, h_t],
+            "stage1_backend": final_s1_backend,
+            "stage1_steps": final_s1_steps,
+            "stage1_seed": final_seed,
+            "headwear_detected": s1_result.headwear_detected,
+            "duration_seconds": s1_duration,
+        }
+        with (exp_dir / "metadata.json").open("w", encoding="utf-8") as f:
+            json.dump(s1_metadata, f, indent=2)
+        with (exp_dir / "warnings.json").open("w", encoding="utf-8") as f:
+            json.dump(warnings, f, indent=2)
+
+        return {
+            "bald_base": bald_base,
+            "stage1_raw_generated": stage1_raw_generated,
+            "stage1_edit_mask": stage1_edit_mask,
+            "stage1_removal_overlay": stage1_removal_overlay,
+            "stage1_protection_mask": stage1_protection_mask,
+            "stage1_headwear_mask": stage1_headwear_mask,
+            "metadata": s1_metadata,
+            "warnings": warnings,
+            "experiment_dir": exp_dir_path,
+        }
 
     # =========================================================
     # STAGE 2: REFERENCE HAIRSTYLE TRANSFER ONTO BALD BASE
@@ -472,6 +532,10 @@ def generate_two_stage_hairstyle_transfer(
 
         stage1_edit_mask.save(exp_dir / "stage1_edit_mask.png")
         stage1_protection_mask.save(exp_dir / "stage1_protection_mask.png")
+        if stage1_removal_overlay:
+            stage1_removal_overlay.save(exp_dir / "stage1_removal_overlay.png")
+        if stage1_headwear_mask:
+            stage1_headwear_mask.save(exp_dir / "stage1_headwear_mask.png")
         if stage1_raw_generated:
             stage1_raw_generated.save(exp_dir / "stage1_raw_generated.png")
         bald_base.save(exp_dir / "bald_base.png")

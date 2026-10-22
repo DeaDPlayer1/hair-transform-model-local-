@@ -166,14 +166,16 @@ def match_image(
 
 def run_pipeline(
     target_path: Path,
-    reference_path: Path,
-    stage1_steps: int = 6,
-    stage2_steps: int = 6,
+    reference_path: Optional[Path] = None,
+    stage1_steps: int = 12,
+    stage2_steps: int = 8,
     scale: float = 0.75,
     guidance_scale: float = 7.5,
     seed: int = 42,
     stage1_backend: str = "auto",
     controlnet: str = "auto",
+    stage1_only: bool = False,
+    headwear_mask: Optional[str] = None,
     output_dir: Path = DEFAULT_OUTPUT_DIR,
 ) -> int:
     """Invoke scripts/try_hair_two_stage.py with the resolved arguments."""
@@ -187,8 +189,6 @@ def run_pipeline(
         str(script_path),
         "--target",
         str(target_path),
-        "--reference",
-        str(reference_path),
         "--stage1-steps",
         str(stage1_steps),
         "--stage2-steps",
@@ -207,14 +207,24 @@ def run_pipeline(
         str(output_dir),
     ]
 
+    if reference_path is not None:
+        cmd.extend(["--reference", str(reference_path)])
+    if stage1_only:
+        cmd.append("--stage1-only")
+    if headwear_mask:
+        cmd.extend(["--headwear-mask", str(headwear_mask)])
+
     print("\n" + "=" * 70)
     print("  Executing Two-Stage Hairstyle Transfer Pipeline")
     print("=" * 70)
     print(f"  Target Image:     {target_path.name} ({target_path})")
-    print(f"  Reference Hair:   {reference_path.name} ({reference_path})")
+    print(f"  Reference Hair:   {reference_path.name if reference_path else '(None - Stage 1 only)'}")
+    print(f"  Stage 1 Only:     {stage1_only}")
+    print(f"  Headwear Mask:    {headwear_mask or '(Auto detect)'}")
     print(f"  Stage 1 Steps:    {stage1_steps} (Bald Conversion)")
-    print(f"  Stage 2 Steps:    {stage2_steps} (Reference Hair Conditioning & Edge Blending)")
-    print(f"  IP-Adapter Scale: {scale}")
+    if not stage1_only:
+        print(f"  Stage 2 Steps:    {stage2_steps} (Reference Hair Conditioning & Edge Blending)")
+        print(f"  IP-Adapter Scale: {scale}")
     print(f"  Random Seed:      {seed}")
     print(f"  Output Directory: {output_dir}")
     print("=" * 70 + "\n")
@@ -337,6 +347,17 @@ def main() -> int:
         help="ControlNet spatial conditioning (auto-disables if weights not present)",
     )
     parser.add_argument(
+        "--stage1-only",
+        action="store_true",
+        help="Run Stage 1 bald conversion only and exit before Stage 2",
+    )
+    parser.add_argument(
+        "--headwear-mask",
+        type=str,
+        default=None,
+        help="Optional path to custom or manual headwear / stage 1 removal mask",
+    )
+    parser.add_argument(
         "--output-dir",
         "-o",
         type=str,
@@ -356,7 +377,21 @@ def main() -> int:
     target_path: Optional[Path] = None
     ref_path: Optional[Path] = None
 
-    if args.target and args.reference:
+    if args.stage1_only:
+        if args.target:
+            target_path = match_image(args.target, assets_dir=assets_dir, role_hint="target")
+            if not target_path:
+                print(f"[ERROR] Could not resolve target image: '{args.target}' in {assets_dir.resolve()}", file=sys.stderr)
+                print_asset_list(assets_dir)
+                return 1
+        else:
+            print_asset_list(assets_dir)
+            while not target_path:
+                val = input("  Select Target Portrait image for Stage 1: ").strip()
+                target_path = match_image(val, assets_dir=assets_dir, role_hint="target")
+                if not target_path:
+                    print(f"    [!] Could not find any target matching '{val}'. Please try again.")
+    elif args.target and args.reference:
         target_path = match_image(args.target, assets_dir=assets_dir, role_hint="target")
         if not target_path:
             print(f"[ERROR] Could not resolve target image: '{args.target}' in {assets_dir.resolve()}", file=sys.stderr)
@@ -372,8 +407,8 @@ def main() -> int:
         # If either is missing, trigger interactive selection
         target_path, ref_path = interactive_selection(assets_dir)
 
-    if not target_path or not ref_path:
-        print("[ERROR] Both target and reference images must be selected.", file=sys.stderr)
+    if not target_path:
+        print("[ERROR] Target portrait image must be selected.", file=sys.stderr)
         return 1
 
     # 3. Execute Two-Stage Pipeline
@@ -387,6 +422,8 @@ def main() -> int:
         seed=args.seed,
         stage1_backend=args.stage1_backend,
         controlnet=args.controlnet,
+        stage1_only=args.stage1_only,
+        headwear_mask=args.headwear_mask,
         output_dir=Path(args.output_dir),
     )
 

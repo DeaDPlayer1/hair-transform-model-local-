@@ -85,7 +85,11 @@ def detect_face_landmarks(
 
     try:
         landmarker = vision.FaceLandmarker.create_from_options(opts)
-        rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+        if hasattr(image_bgr, "convert"):
+            rgb = np.asarray(image_bgr.convert("RGB"))
+            image_bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        else:
+            rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
         result = landmarker.detect(mp_image)
     except Exception as exc:
