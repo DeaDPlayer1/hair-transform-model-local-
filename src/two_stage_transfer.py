@@ -143,6 +143,7 @@ def generate_two_stage_hairstyle_transfer(
     donor_coverage_threshold: Optional[float] = None,
     use_controlnet: str = "auto",
     stage1_only: bool = False,
+    bald_base: Optional[Image.Image] = None,
     headwear_mask: Optional[Union[str, Path, Image.Image, np.ndarray]] = None,
     detect_headwear: bool = True,
     save_experiment: bool = True,
@@ -239,43 +240,52 @@ def generate_two_stage_hairstyle_transfer(
     # =========================================================
     # STAGE 1: BALD BASE CONVERSION
     # =========================================================
-    logger.info("TwoStageTransfer: Starting Stage 1 (Bald/Scalp Reconstruction)...")
-    s1_t0 = time.perf_counter()
+    if bald_base is None:
+        logger.info("TwoStageTransfer: Starting Stage 1 (Bald/Scalp Reconstruction)...")
+        s1_t0 = time.perf_counter()
 
-    s1_config = BaldConverterConfig(
-        backend=final_s1_backend,
-        num_inference_steps=final_s1_steps,
-        guidance_scale=final_guidance,
-        hair_mask_expansion_ratio=s1_cfg.get("hair_mask_expansion_ratio", BaldConverterConfig.hair_mask_expansion_ratio),
-        max_hair_mask_expansion_px=s1_cfg.get("max_hair_mask_expansion_px", BaldConverterConfig.max_hair_mask_expansion_px),
-        feather_width_px=s1_cfg.get("feather_width_px", BaldConverterConfig.feather_width_px),
-        prompt=s1_cfg.get("prompt", BaldConverterConfig.prompt),
-        negative_prompt=s1_cfg.get("negative_prompt", BaldConverterConfig.negative_prompt),
-        onnx_model_path=s1_cfg.get("onnx_model_path", None),
-        headwear_mask_path=headwear_mask if isinstance(headwear_mask, (str, Path)) else s1_cfg.get("headwear_mask_path", None),
-        detect_headwear=detect_headwear,
-        seed=final_seed,
-    )
+        s1_config = BaldConverterConfig(
+            backend=final_s1_backend,
+            num_inference_steps=final_s1_steps,
+            guidance_scale=final_guidance,
+            hair_mask_expansion_ratio=s1_cfg.get("hair_mask_expansion_ratio", BaldConverterConfig.hair_mask_expansion_ratio),
+            max_hair_mask_expansion_px=s1_cfg.get("max_hair_mask_expansion_px", BaldConverterConfig.max_hair_mask_expansion_px),
+            feather_width_px=s1_cfg.get("feather_width_px", BaldConverterConfig.feather_width_px),
+            prompt=s1_cfg.get("prompt", BaldConverterConfig.prompt),
+            negative_prompt=s1_cfg.get("negative_prompt", BaldConverterConfig.negative_prompt),
+            onnx_model_path=s1_cfg.get("onnx_model_path", None),
+            headwear_mask_path=headwear_mask if isinstance(headwear_mask, (str, Path)) else s1_cfg.get("headwear_mask_path", None),
+            detect_headwear=detect_headwear,
+            seed=final_seed,
+        )
 
-    bald_converter = create_bald_converter(s1_config, pipeline=shared_pipeline)
-    s1_result = bald_converter.convert(
-        target_image=target_img_rgb,
-        target_hair_mask=target_hair_mask_clean,
-        target_segmentation_map=target_segmentation_map,
-        face_landmarks=face_landmarks,
-        headwear_mask=headwear_mask,
-        seed=final_seed,
-    )
-    s1_duration = time.perf_counter() - s1_t0
+        bald_converter = create_bald_converter(s1_config, pipeline=shared_pipeline)
+        s1_result = bald_converter.convert(
+            target_image=target_img_rgb,
+            target_hair_mask=target_hair_mask_clean,
+            target_segmentation_map=target_segmentation_map,
+            face_landmarks=face_landmarks,
+            headwear_mask=headwear_mask,
+            seed=final_seed,
+        )
+        s1_duration = time.perf_counter() - s1_t0
 
-    bald_base = s1_result.bald_base
-    stage1_edit_mask = s1_result.edit_mask
-    stage1_protection_mask = s1_result.protection_mask
-    stage1_removal_overlay = s1_result.removal_overlay
-    stage1_headwear_mask = s1_result.headwear_mask
-    stage1_raw_generated = s1_result.raw_generated
-    if s1_result.warnings:
-        warnings.extend(s1_result.warnings)
+        bald_base = s1_result.bald_base
+        stage1_edit_mask = s1_result.edit_mask
+        stage1_protection_mask = s1_result.protection_mask
+        stage1_removal_overlay = s1_result.removal_overlay
+        stage1_headwear_mask = s1_result.headwear_mask
+        stage1_raw_generated = s1_result.raw_generated
+        if s1_result.warnings:
+            warnings.extend(s1_result.warnings)
+    else:
+        logger.info("TwoStageTransfer: Using provided pre-computed bald base.")
+        s1_duration = 0.0
+        stage1_edit_mask = Image.new("L", (w_t, h_t), 0)
+        stage1_protection_mask = Image.new("L", (w_t, h_t), 0)
+        stage1_removal_overlay = None
+        stage1_headwear_mask = None
+        stage1_raw_generated = None
 
     # Validate Stage 1 outputs
     if bald_base.size != (w_t, h_t):
@@ -357,23 +367,43 @@ def generate_two_stage_hairstyle_transfer(
         warnings.append(f"Stage 2: Pruned {pruned_count} false-positive backdrop pixels from reference hair mask.")
 
     # IP-Adapter reference crop
+    # IP-Adapter reference crop
     ref_crop = prepare_reference_crop(ref_img_rgb, cleaned_ref_hair_pil)
+
+    # Stage 2 residual hair detection on bald_base (Requirement A)
+    # Do not silently assume residual mask is empty. Segment actual bald base:
+    from src.hair_segmentation import segment_hair as app_segment_hair
+
+    bald_hair_mask_pil, _, _, _, bald_seg_map = app_segment_hair(bald_base, return_seg_map=True)
+    bald_hair_np = np.asarray(bald_hair_mask_pil.convert("L"))
+    residual_hair_count = int(np.count_nonzero(bald_hair_np > 128))
+
+    # If genuine residual hair was detected (> 500 px), mark for repair; otherwise clean zero mask
+    if residual_hair_count > 500:
+        residual_hair_mask_pil = bald_hair_mask_pil
+        warnings.append(
+            f"Stage 2: Detected {residual_hair_count} residual hair pixels on bald base; marking for repair."
+        )
+    else:
+        residual_hair_mask_pil = Image.new("L", (w_t, h_t), 0)
 
     # Hairstyle alignment:
     # Target image for alignment is the STAGE 1 BALD BASE!
-    # Target hair mask passed is the ORIGINAL hair mask (ensures full union coverage)
+    # Target hair mask passed is the RESIDUAL hair mask (ensures clean bald scalp is preserved
+    # and prevents false pompadour removal in empty space)
     alignment_result = align_reference_to_target(
         target_image=bald_base,
         reference_image=ref_img_rgb,
-        target_hair_mask=target_hair_mask_clean,
+        target_hair_mask=residual_hair_mask_pil,
         reference_hair_mask=cleaned_ref_hair_pil,
         target_landmarks=face_landmarks,
         reference_landmarks=reference_landmarks,
-        target_segmentation_map=target_segmentation_map,
+        target_segmentation_map=bald_seg_map,
         cranial_expansion_px=final_cranial,
         feather_width_px=final_feather,
         hairline_transition_px=final_transition,
         donor_coverage_threshold=final_threshold,
+        contact_shadow_strength=s2_cfg.get("contact_shadow_strength", 0.25),
     )
 
     if alignment_result.get("warnings"):
@@ -385,68 +415,104 @@ def generate_two_stage_hairstyle_transfer(
     edge_repair_mask = alignment_result["edge_repair_mask"]
     broad_edit_mask = alignment_result["broad_edit_mask"]
     identity_protection = alignment_result.get("identity_protection")
+    contact_shadow_map = alignment_result.get("contact_shadow_map")
+    validation_result = alignment_result.get("validation_result", {})
+    validation_overlay = alignment_result.get("validation_overlay")
 
     # Inpainting on bald base pre-composite with aspect-preserving dimensions divisible by 8
     inpainting_base = aligned_composite_before_diffusion
-    inpaint_w, inpaint_h = compute_inpaint_dimensions(w_t, h_t, max_dim=512, min_dim=512)
-    inpaint_input = inpainting_base.resize((inpaint_w, inpaint_h), Image.Resampling.LANCZOS)
-    inpaint_mask = edge_repair_mask.resize((inpaint_w, inpaint_h), Image.Resampling.NEAREST)
+    edge_mask_np = np.asarray(edge_repair_mask)
+    active_repair_px = int(np.count_nonzero(edge_mask_np > 128))
 
-    # Configure diffusion generator with Stage 2 seed (derived deterministically)
-    import torch
+    # Evaluate whether seam diffusion is necessary and valid (Requirement B & E)
+    should_inpaint = validation_result.get("should_inpaint", active_repair_px > 0)
+    if active_repair_px == 0:
+        should_inpaint = False
+        logger.info("TwoStageTransfer: Edge repair mask is empty (0 px). Aligned pre-diffusion composite is preserved.")
+        warnings.append("Stage 2: Hairline seam is already photorealistic; diffusion step safely bypassed.")
+    elif not validation_result.get("is_valid", True):
+        logger.warning(
+            f"TwoStageTransfer: Repair mask validation flagged issues: {validation_result.get('reasons')}. Using sanitized mask."
+        )
+        warnings.append(f"Stage 2: Sanitized edge repair mask applied: {validation_result.get('reasons')}")
+        edge_mask_np = validation_result.get("sanitized_mask_np", edge_mask_np)
+        edge_repair_mask = Image.fromarray(edge_mask_np, mode="L")
 
-    device = "cpu"
-    if hasattr(shared_pipeline, "device") and isinstance(getattr(shared_pipeline, "device"), (str, torch.device)):
-        device = shared_pipeline.device
     stage2_seed = final_seed + 1000
-    generator = torch.Generator(device=device).manual_seed(stage2_seed)
 
-    if hasattr(shared_pipeline, "set_ip_adapter_scale"):
-        shared_pipeline.set_ip_adapter_scale(final_scale)
+    if should_inpaint:
+        inpaint_w, inpaint_h = compute_inpaint_dimensions(w_t, h_t, max_dim=512, min_dim=512)
+        inpaint_input = inpainting_base.resize((inpaint_w, inpaint_h), Image.Resampling.LANCZOS)
+        inpaint_mask = edge_repair_mask.resize((inpaint_w, inpaint_h), Image.Resampling.NEAREST)
 
-    prompt = "natural realistic hair, highly detailed, clean hairline, high resolution photography"
-    negative_prompt = "bald spots, thin hair, gaps, blur, artifacts, plastic, drawing, cartoon, bad anatomy"
+        # Configure diffusion generator with Stage 2 seed (derived deterministically)
+        import torch
 
-    pipe_kwargs = {
-        "prompt": prompt,
-        "negative_prompt": negative_prompt,
-        "image": inpaint_input,
-        "mask_image": inpaint_mask,
-        "num_inference_steps": final_s2_steps,
-        "guidance_scale": final_guidance,
-        "generator": generator,
-    }
-    if hasattr(shared_pipeline, "image_encoder") and shared_pipeline.image_encoder is not None:
-        pipe_kwargs["ip_adapter_image"] = ref_crop
+        device = "cpu"
+        if hasattr(shared_pipeline, "device") and isinstance(getattr(shared_pipeline, "device"), (str, torch.device)):
+            device = shared_pipeline.device
+        generator = torch.Generator(device=device).manual_seed(stage2_seed)
 
-    diffusion_output = shared_pipeline(**pipe_kwargs)
-    stage2_raw_generated = diffusion_output.images[0].resize((w_t, h_t), Image.Resampling.LANCZOS)
+        if hasattr(shared_pipeline, "set_ip_adapter_scale"):
+            shared_pipeline.set_ip_adapter_scale(final_scale)
+
+        prompt = "natural realistic hair, highly detailed, clean hairline, high resolution photography"
+        negative_prompt = "bald spots, thin hair, gaps, blur, artifacts, plastic, drawing, cartoon, bad anatomy"
+
+        pipe_kwargs = {
+            "prompt": prompt,
+            "negative_prompt": negative_prompt,
+            "image": inpaint_input,
+            "mask_image": inpaint_mask,
+            "num_inference_steps": final_s2_steps,
+            "guidance_scale": final_guidance,
+            "generator": generator,
+        }
+        if hasattr(shared_pipeline, "image_encoder") and shared_pipeline.image_encoder is not None:
+            pipe_kwargs["ip_adapter_image"] = ref_crop
+
+        diffusion_output = shared_pipeline(**pipe_kwargs)
+        stage2_raw_generated = diffusion_output.images[0].resize((w_t, h_t), Image.Resampling.LANCZOS)
+    else:
+        stage2_raw_generated = inpainting_base
 
     # Final Compositing & Strict Identity / Outside-Region Preservation
     # 1. Start with inpainting base
     raw_np = np.asarray(stage2_raw_generated)
     inpaint_base_np = np.asarray(inpainting_base)
-    edge_mask_np = np.asarray(edge_repair_mask)
     broad_mask_np = np.asarray(broad_edit_mask)
     orig_target_np = np.asarray(target_img_rgb)
 
-    # Feather edge repair mask for seamless blending
-    feather_repair = max(1.0, float(final_feather))
-    dist_repair = cv2.distanceTransform((edge_mask_np > 128).astype(np.uint8), cv2.DIST_L2, 5)
-    blend_repair = np.clip(dist_repair / feather_repair, 0.0, 1.0).astype(np.float32)
+    if should_inpaint:
+        # Feather edge repair mask for seamless blending
+        feather_repair = max(1.0, float(final_feather))
+        dist_repair = cv2.distanceTransform((edge_mask_np > 128).astype(np.uint8), cv2.DIST_L2, 5)
+        blend_repair = np.clip(dist_repair / feather_repair, 0.0, 1.0).astype(np.float32)
 
-    # Composite diffusion into inpainting base
-    final_np = (
-        inpaint_base_np.astype(np.float32) * (1.0 - blend_repair[..., None])
-        + raw_np.astype(np.float32) * blend_repair[..., None]
-    ).clip(0, 255).astype(np.uint8)
+        # Composite diffusion into inpainting base
+        final_np = (
+            inpaint_base_np.astype(np.float32) * (1.0 - blend_repair[..., None])
+            + raw_np.astype(np.float32) * blend_repair[..., None]
+        ).clip(0, 255).astype(np.uint8)
+    else:
+        final_np = inpaint_base_np.copy()
 
-    # 2. Strictly protect identity pixels (ears, eyes, brows, nose, mouth)
+    # 2. Strictly protect facial features (eyes, eyebrows, nose, mouth) while allowing donor hair
+    # to naturally overlap ear cartilage and drape over shoulders as established in baseline
     if identity_protection is not None:
         ident_np = np.asarray(identity_protection)
         if ident_np.shape[:2] != (h_t, w_t):
             ident_np = cv2.resize(ident_np, (w_t, h_t), interpolation=cv2.INTER_NEAREST)
-        final_np[ident_np > 0] = orig_target_np[ident_np > 0]
+
+        # Identify ear cartilage so hair curls can drape over ears naturally
+        face_core_protection = ident_np.copy()
+        if bald_seg_map is not None:
+            ear_cartilage_mask = np.isin(bald_seg_map, EAR_SEG_CLASSES)
+            # Only allow ear pass-through where donor hair is present and opaque
+            hair_over_ears = ear_cartilage_mask & (aligned_donor_alpha > 0.25)
+            face_core_protection[hair_over_ears] = 0
+
+        final_np[face_core_protection > 0] = orig_target_np[face_core_protection > 0]
 
     # 3. Restore ORIGINAL target pixels outside combined broad replacement envelope
     # Ensures the broad replacement envelope includes the union of permitted changes introduced
@@ -502,7 +568,7 @@ def generate_two_stage_hairstyle_transfer(
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "original_dimensions": [w_t, h_t],
         "reference_dimensions": [w_r, h_r],
-        "stage1_backend": s1_result.metadata.get("backend", final_s1_backend),
+        "stage1_backend": s1_result.metadata.get("backend", final_s1_backend) if ('s1_result' in locals() and s1_result is not None) else "precomputed",
         "stage1_steps": final_s1_steps,
         "stage1_seed": final_seed,
         "stage2_steps": final_s2_steps,
@@ -586,6 +652,13 @@ def generate_two_stage_hairstyle_transfer(
 
         broad_edit_mask.save(exp_dir / "stage2_broad_edit_mask.png")
         edge_repair_mask.save(exp_dir / "stage2_edge_repair_mask.png")
+        residual_hair_mask_pil.save(exp_dir / "residual_hair_mask.png")
+        if validation_overlay is not None:
+            Image.fromarray(validation_overlay).save(exp_dir / "repair_mask_validation_overlay.png")
+        if contact_shadow_map is not None and np.any(contact_shadow_map > 0):
+            Image.fromarray((np.clip(contact_shadow_map, 0, 1) * 255).astype(np.uint8)).save(
+                exp_dir / "contact_shadow_map.png"
+            )
         aligned_composite_before_diffusion.save(exp_dir / "aligned_composite_before_diffusion.png")
         stage2_raw_generated.save(exp_dir / "stage2_raw_generated.png")
         final_composite.save(exp_dir / "final_composite.png")
@@ -619,10 +692,14 @@ def generate_two_stage_hairstyle_transfer(
         "stage1_edit_mask": stage1_edit_mask,
         "stage2_raw_generated": stage2_raw_generated,
         "edge_repair_mask": edge_repair_mask,
+        "residual_hair_mask": residual_hair_mask_pil,
         "broad_edit_mask": broad_edit_mask,
         "aligned_composite_before_diffusion": aligned_composite_before_diffusion,
         "aligned_donor_rgb": aligned_donor_rgb,
         "aligned_donor_alpha": aligned_donor_alpha,
+        "contact_shadow_map": contact_shadow_map,
+        "validation_result": validation_result,
+        "validation_overlay": validation_overlay,
         "reference_crop": ref_crop,
         "metrics": metrics,
         "metadata": metadata,
