@@ -24,6 +24,7 @@ from PIL import Image
 from src.bald_converter import (
     BaldConverterConfig,
     create_bald_converter,
+    compute_inpaint_dimensions,
 )
 from src.hair_mask_refinement import refine_reference_hair_mask
 from src.hairstyle_alignment import (
@@ -54,11 +55,11 @@ def load_two_stage_config(config_path: Optional[Union[str, Path]] = None) -> Dic
     return {
         "stage1": {
             "backend": "auto",
-            "num_inference_steps": 8,
+            "num_inference_steps": 12,
             "guidance_scale": 7.5,
-            "hair_mask_expansion_ratio": 0.01,
-            "max_hair_mask_expansion_px": 12,
-            "feather_width_px": 2.0,
+            "hair_mask_expansion_ratio": 0.035,
+            "max_hair_mask_expansion_px": 32,
+            "feather_width_px": 3.0,
         },
         "stage2": {
             "num_inference_steps": 8,
@@ -385,10 +386,11 @@ def generate_two_stage_hairstyle_transfer(
     broad_edit_mask = alignment_result["broad_edit_mask"]
     identity_protection = alignment_result.get("identity_protection")
 
-    # Inpainting on bald base pre-composite
+    # Inpainting on bald base pre-composite with aspect-preserving dimensions divisible by 8
     inpainting_base = aligned_composite_before_diffusion
-    inpaint_input_512 = inpainting_base.resize((512, 512), Image.Resampling.LANCZOS)
-    inpaint_mask_512 = edge_repair_mask.resize((512, 512), Image.Resampling.NEAREST)
+    inpaint_w, inpaint_h = compute_inpaint_dimensions(w_t, h_t, max_dim=512, min_dim=512)
+    inpaint_input = inpainting_base.resize((inpaint_w, inpaint_h), Image.Resampling.LANCZOS)
+    inpaint_mask = edge_repair_mask.resize((inpaint_w, inpaint_h), Image.Resampling.NEAREST)
 
     # Configure diffusion generator with Stage 2 seed (derived deterministically)
     import torch
@@ -408,8 +410,8 @@ def generate_two_stage_hairstyle_transfer(
     pipe_kwargs = {
         "prompt": prompt,
         "negative_prompt": negative_prompt,
-        "image": inpaint_input_512,
-        "mask_image": inpaint_mask_512,
+        "image": inpaint_input,
+        "mask_image": inpaint_mask,
         "num_inference_steps": final_s2_steps,
         "guidance_scale": final_guidance,
         "generator": generator,
@@ -533,8 +535,37 @@ def generate_two_stage_hairstyle_transfer(
         # Reference mask overlay
         ref_overlay = ref_rgb_np.copy()
         mask_b = cleaned_ref_hair_np > 128
-        ref_overlay[mask_b] = (ref_overlay[mask_b].astype(float) * 0.5 + np.array([0, 255, 0]) * 0.5).astype(np.uint8)
         Image.fromarray(ref_overlay).save(exp_dir / "reference_mask_overlay.png")
+
+        # Selective fill diagnostic masks
+        if alignment_result.get("reference_mask_filled") is not None:
+            Image.fromarray(alignment_result["reference_mask_filled"]).save(exp_dir / "reference_hair_mask_filled.png")
+        if alignment_result.get("reference_fill_mask") is not None:
+            Image.fromarray(alignment_result["reference_fill_mask"]).save(exp_dir / "reference_hair_mask_holes.png")
+
+        # Alignment anchor diagnostic overlay
+        if (face_landmarks and face_landmarks.get("detected") and
+            reference_landmarks and reference_landmarks.get("detected") and
+            alignment_result.get("transform_info", {}).get("matrix") is not None):
+            try:
+                from src.hairstyle_alignment import ALIGNMENT_ANCHOR_INDICES, build_symmetric_correspondence
+                t_diag = orig_target_np.copy()
+                M = alignment_result["transform_info"]["matrix"]
+                src_pts, dst_pts = build_symmetric_correspondence(
+                    reference_landmarks["landmarks_2d"],
+                    face_landmarks["landmarks_2d"],
+                    is_src_mirrored=alignment_result.get("pose_info", {}).get("recommend_mirror", False),
+                    anchor_indices=ALIGNMENT_ANCHOR_INDICES,
+                )
+                ones = np.ones((len(src_pts), 1))
+                warped_src = (np.hstack([src_pts, ones]) @ M.T).astype(np.int32)
+                for p_dst, p_warp in zip(dst_pts.astype(np.int32), warped_src):
+                    cv2.circle(t_diag, tuple(p_dst), 10, (0, 255, 255), -1)  # Yellow: Target anchors
+                    cv2.circle(t_diag, tuple(p_warp), 8, (255, 0, 255), -1)  # Magenta: Warped Ref anchors
+                    cv2.line(t_diag, tuple(p_dst), tuple(p_warp), (0, 255, 0), 2)  # Green: Residual
+                Image.fromarray(t_diag).save(exp_dir / "alignment_anchor_diagnostic.png")
+            except Exception as e:
+                logger.warning(f"Failed to generate alignment anchor diagnostic: {e}")
 
         stage1_edit_mask.save(exp_dir / "stage1_edit_mask.png")
         stage1_protection_mask.save(exp_dir / "stage1_protection_mask.png")

@@ -1,13 +1,13 @@
 {
   "stage1": {
     "backend": "auto",
-    "num_inference_steps": 8,
+    "num_inference_steps": 12,
     "guidance_scale": 7.5,
-    "hair_mask_expansion_ratio": 0.01,
-    "max_hair_mask_expansion_px": 12,
-    "feather_width_px": 2.0,
-    "prompt": "Photorealistic portrait of the same person with naturally bald, clean scalp skin. Preserve the exact facial identity, forehead proportions, eyebrows, eyes, ears, expression, lighting, camera angle, clothing and background.",
-    "negative_prompt": "hair, loose hair strands, wig, hair cap, distorted scalp, changed face, changed eyebrows, changed eyes, altered ears, deformed forehead, blurry skin, artificial skin, artifacts"
+    "hair_mask_expansion_ratio": 0.035,
+    "max_hair_mask_expansion_px": 32,
+    "feather_width_px": 3.0,
+    "prompt": "Photorealistic portrait of the same person, clean smooth bald head, shaved bald head, completely bald scalp, natural scalp skin, smooth skin on top of head, shaved bald hairstyle. Clean neutral wall background, natural lighting, hyperrealistic, high resolution.",
+    "negative_prompt": "hair, stubble, bangs, fringe, hat, cap, baseball cap, beanie, helmet, headwear, wig, toupee, fuzzy hair, curly hair, long hair, hair strands, texture, distorted, blurry, deformed forehead, artifacts, colorful, purple"
   },
   "stage2": {
     "num_inference_steps": 8,

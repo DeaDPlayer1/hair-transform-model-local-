@@ -67,16 +67,6 @@ def refine_reference_hair_mask(
     backdrop_color = np.median(bg_corners, axis=0)
     backdrop_std = float(np.std(bg_corners, axis=0).max())
 
-    # Bound prune threshold strictly:
-    # If backdrop_std is high (>35), the backdrop is non-uniform, so use a very tight conservative threshold
-    if backdrop_std > 35.0:
-        prune_threshold = 24.0
-    else:
-        prune_threshold = float(np.clip(backdrop_std * 2.2, 18.0, 42.0))
-
-    color_dist = np.linalg.norm(ref_rgb.astype(np.float32) - backdrop_color, axis=-1)
-    is_backdrop = color_dist < prune_threshold
-
     # Core hair: erosion of hair mask around the upper head
     hair_u8 = hair.astype(np.uint8)
     core_deep_k = max(5, int(round(9 * (max(h_r, w_r) / 512.0))))
@@ -85,6 +75,22 @@ def refine_reference_hair_mask(
     hair_core_deep = cv2.erode(
         hair_u8, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (core_deep_k, core_deep_k))
     )
+    core_pts = ref_rgb[hair_core_deep > 0] if np.any(hair_core_deep > 0) else ref_rgb[hair]
+    core_hair_color = np.median(core_pts, axis=0) if len(core_pts) > 0 else np.array([50.0, 35.0, 25.0])
+
+    dist_to_bg = np.linalg.norm(ref_rgb.astype(np.float32) - backdrop_color, axis=-1)
+    dist_to_hair = np.linalg.norm(ref_rgb.astype(np.float32) - core_hair_color, axis=-1)
+
+    # Dynamic prune threshold:
+    # A pixel is considered backdrop if:
+    # 1. Color distance to backdrop is within statistical margin (std * 2.5, min 22, max 55)
+    # 2. OR it is significantly closer to backdrop than to core hair (dist_to_bg < dist_to_hair * 0.75 and dist_to_bg < 65)
+    base_thresh = float(np.clip(max(backdrop_std * 2.5, 22.0), 22.0, 55.0))
+    prune_threshold = base_thresh
+    ref_hsv = cv2.cvtColor(ref_rgb, cv2.COLOR_RGB2HSV)
+    backdrop_hsv = cv2.cvtColor(np.uint8([[backdrop_color]]), cv2.COLOR_RGB2HSV)[0, 0]
+    is_neutral_backdrop = (ref_hsv[:, :, 1] < max(25, int(backdrop_hsv[1]) + 20)) & (ref_hsv[:, :, 2] > max(90, int(backdrop_hsv[2]) - 60))
+    is_backdrop = (dist_to_bg < base_thresh) | ((dist_to_bg < dist_to_hair * 0.75) & (dist_to_bg < 65.0)) | (is_neutral_backdrop & (dist_to_bg < 100.0) & (dist_to_bg < dist_to_hair))
 
     # Identify head region from landmarks if available
     head_core_y = int(h_r * 0.5)
@@ -179,7 +185,41 @@ def decontaminate_reference_hair_rgb(
         unknown_region = ((binary > 0) & (core_hair == 0)).astype(np.uint8)
 
     if np.any(core_hair > 0) and np.any(unknown_region > 0):
-        decontaminated_rgb = cv2.inpaint(reference_rgb, unknown_region, inpaint_radius, cv2.INPAINT_TELEA)
+        # Sample interior core hair color to guard against backdrop sampling
+        core_pixels = reference_rgb[core_hair > 0]
+        median_hair = np.median(core_pixels, axis=0).astype(np.uint8) if len(core_pixels) > 0 else np.array([50, 35, 25], dtype=np.uint8)
+
+        # Identify rim pixels that are actually contaminated by studio backdrop
+        ref_hsv = cv2.cvtColor(reference_rgb, cv2.COLOR_RGB2HSV)
+        backdrop_color = np.median(reference_rgb[:max(5, int(h_r * 0.03)), :max(5, int(w_r * 0.03))], axis=(0, 1))
+        dist_to_bg = np.linalg.norm(reference_rgb.astype(np.float32) - backdrop_color, axis=-1)
+        dist_to_hair = np.linalg.norm(reference_rgb.astype(np.float32) - median_hair.astype(np.float32), axis=-1)
+        backdrop_hsv = cv2.cvtColor(np.uint8([[backdrop_color]]), cv2.COLOR_RGB2HSV)[0, 0]
+
+        # Requirement C: Preserve genuine hair strands.
+        # Do not remove every low-saturation, high-brightness pixel indiscriminately.
+        # A rim pixel is contaminated only if it is actually close to the backdrop color
+        # and closer to backdrop than to interior hair color.
+        is_bg_color_match = (dist_to_bg < 45.0) & (dist_to_bg < dist_to_hair * 1.25)
+        is_backdrop_bright_neutral = bool((backdrop_hsv[1] < 45) and (backdrop_hsv[2] > 80))
+        is_neutral_bleed = (
+            is_backdrop_bright_neutral
+            & (ref_hsv[:, :, 1] < 35)
+            & (ref_hsv[:, :, 2] > 110)
+            & (dist_to_bg < 75.0)
+            & (dist_to_bg < dist_to_hair)
+        )
+        contaminated = (unknown_region > 0) & (is_bg_color_match | is_neutral_bleed)
+
+        if np.any(contaminated):
+            guarded_canvas = reference_rgb.copy()
+            guarded_canvas[binary == 0] = median_hair
+            inpainted_rgb = cv2.inpaint(guarded_canvas, contaminated.astype(np.uint8), inpaint_radius, cv2.INPAINT_TELEA)
+
+            decontaminated_rgb = reference_rgb.copy()
+            decontaminated_rgb[contaminated] = inpainted_rgb[contaminated]
+        else:
+            decontaminated_rgb = reference_rgb.copy()
     else:
         decontaminated_rgb = reference_rgb.copy()
     return decontaminated_rgb, unknown_region

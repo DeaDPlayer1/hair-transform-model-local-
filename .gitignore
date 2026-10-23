@@ -64,8 +64,10 @@ outputs/my_hairstyle_test/
 outputs/my_random_test_*/
 outputs/debug_overlays/
 outputs/stage1_generalization/
+outputs/stage2_validation/
 outputs/test_*/
 outputs/test_*
 models/bald_converter/
 scratch/
+graphify-out/
 

@@ -17,37 +17,58 @@ from PIL import Image
 
 from src.hair_segmentation import segment_hair as app_segment_hair
 from src.face_landmarks import detect_face_landmarks
+from src.bald_converter import (
+    BaldConverterConfig,
+    create_bald_converter,
+    compute_inpaint_dimensions,
+)
 from src.local_generative_transfer import load_local_generative_pipeline
 from src.two_stage_transfer import generate_two_stage_hairstyle_transfer
 
 
 def resolve_image_path(p_str: str) -> Path:
-    """Robustly resolve image paths handling spaces, underscores, and relative/absolute paths."""
+    """Robustly resolve image paths handling spaces, underscores, extension variations (.jpg/.png), and assets/ lookups."""
+    if not p_str:
+        return Path(p_str)
+
     p = Path(p_str)
     if p.is_file():
         return p.resolve()
 
-    # Try matching space <-> underscore variations
-    cand_space = Path(str(p).replace("_", " "))
-    if cand_space.is_file():
-        return cand_space.resolve()
+    IMAGE_EXTS = [".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".JPG", ".JPEG", ".PNG"]
+    cand_dirs = [p.parent, Path("."), Path("assets")]
+    cand_stems = [
+        p.stem,
+        p.stem.replace("_", " "),
+        p.stem.replace(" ", "_"),
+        p.name,
+        p.name.replace("_", " "),
+        p.name.replace(" ", "_"),
+    ]
 
-    cand_under = Path(str(p).replace(" ", "_"))
-    if cand_under.is_file():
-        return cand_under.resolve()
+    # 1. Direct suffix variants in candidate directories
+    for d in cand_dirs:
+        if not d.is_dir():
+            continue
+        for stem in cand_stems:
+            for ext in IMAGE_EXTS:
+                cand = d / f"{stem}{ext}"
+                if cand.is_file():
+                    return cand.resolve()
 
-    # Check if file exists inside assets/ directory as fallback
-    assets_dir = Path("assets")
-    if assets_dir.is_dir():
-        cand_asset = assets_dir / p.name
-        if cand_asset.is_file():
-            return cand_asset.resolve()
-        cand_asset_space = assets_dir / p.name.replace("_", " ")
-        if cand_asset_space.is_file():
-            return cand_asset_space.resolve()
-        cand_asset_under = assets_dir / p.name.replace(" ", "_")
-        if cand_asset_under.is_file():
-            return cand_asset_under.resolve()
+    # 2. Case-insensitive and stem-matching scan
+    for d in cand_dirs:
+        if not d.is_dir():
+            continue
+        try:
+            for item in d.iterdir():
+                if item.is_file():
+                    if item.stem.lower() in [s.lower() for s in cand_stems]:
+                        return item.resolve()
+                    if item.name.lower() in [s.lower() for s in cand_stems]:
+                        return item.resolve()
+        except Exception:
+            pass
 
     return p
 
@@ -151,17 +172,32 @@ def main():
     target_path = resolve_image_path(args.target)
     ref_path = resolve_image_path(args.reference) if args.reference else None
 
+    def _print_available_assets():
+        assets_p = Path("assets")
+        if assets_p.is_dir():
+            files = [f.name for f in assets_p.iterdir() if f.is_file() and f.suffix.lower() in [".jpg", ".jpeg", ".png", ".webp"]]
+            print(f"Available images in assets/: {', '.join(sorted(files))}")
+
     if not target_path.is_file():
         print(f"\n[ERROR] Target image file not found: '{args.target}' (resolved: '{target_path}')")
+        _print_available_assets()
         sys.exit(1)
 
     if not args.stage1_only and (ref_path is None or not ref_path.is_file()):
         print(f"\n[ERROR] Reference image required for full two-stage run: '{args.reference}'")
+        _print_available_assets()
         sys.exit(1)
 
     print("\n========================================================")
     print("  HairTryOn — Two-Stage Hairstyle Transfer Pipeline")
     print("========================================================")
+    print("Integrated Core Models & Architecture:")
+    print("  • Segmentation:      ResNet18 Face Parsing (ONNX Runtime CPU)")
+    print("  • Generative Model:  Stable Diffusion 1.5 Inpainting (Diffusers)")
+    print("  • Style Transfer:    IP-Adapter Plus (ViT-H/14 Cross-Attention)")
+    print("  • Stage 1 Core:      BaldConverter (src/bald_converter.py)")
+    print("  • Stage 2 Core:      TwoStageTransfer (src/two_stage_transfer.py)")
+    print("--------------------------------------------------------")
     print(f"Target path:         {target_path}")
     print(f"Reference path:      {ref_path if ref_path else '(None - Stage 1 only)'}")
     print(f"Output directory:    {args.output_dir}")

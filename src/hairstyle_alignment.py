@@ -44,6 +44,10 @@ from src.hair_mask_refinement import (
     EAR_SEG_CLASSES,
     CLOTHING_SEG_CLASSES,
 )
+from src.bald_converter import (
+    JAWLINE_CONTOUR_INDICES,
+    BROW_ARCH_INDICES,
+)
 
 
 # ─── Configuration ────────────────────────────────────────────────────
@@ -138,6 +142,92 @@ def estimate_head_geometry(landmarks_2d: np.ndarray) -> Dict[str, Any]:
     }
 
 
+def selective_fill_reference_mask_holes(
+    ref_hair_binary: np.ndarray,
+    reference_rgb: np.ndarray,
+    reference_landmarks: Optional[Dict[str, Any]] = None,
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+    """
+    Selectively fill internal holes (like forehead skin gaps and segmentation dropout)
+    while strictly preserving legitimate open spaces between external curls, fine strands,
+    and background voids.
+
+    Args:
+        ref_hair_binary: (H, W) uint8 binary mask (0 or 255)
+        reference_rgb: (H, W, 3) uint8 reference RGB image
+        reference_landmarks: optional detected landmarks dict
+
+    Returns:
+        (filled_binary, fill_mask, info_dict)
+    """
+    h, w = ref_hair_binary.shape[:2]
+    binary = (ref_hair_binary > 0).astype(np.uint8) * 255
+    if not np.any(binary > 0):
+        return binary.copy(), np.zeros_like(binary), {"filled_count": 0, "preserved_count": 0, "filled_pixels": 0}
+
+    # Estimate background color from outer border margins
+    m = max(5, int(min(h, w) * 0.03))
+    corners = np.vstack([
+        reference_rgb[:m, :m],
+        reference_rgb[:m, -m:],
+    ]).reshape(-1, 3)
+    bg_mean = corners.mean(axis=0)
+
+    # Scale-aware area thresholds
+    total_px = h * w
+    tiny_thresh = max(15, int(round(total_px * 0.0001))) # ~100px on 1024x1024
+    max_thresh = max(1000, int(round(total_px * 0.004)))  # ~4000px on 1024x1024
+
+    inv = cv2.bitwise_not(binary)
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(inv, connectivity=8)
+
+    fill_mask = np.zeros_like(binary)
+    filled_components = []
+    preserved_components = []
+
+    for i in range(1, num_labels):
+        x = stats[i, cv2.CC_STAT_LEFT]
+        y = stats[i, cv2.CC_STAT_TOP]
+        cw = stats[i, cv2.CC_STAT_WIDTH]
+        ch = stats[i, cv2.CC_STAT_HEIGHT]
+        area = stats[i, cv2.CC_STAT_AREA]
+
+        # Ignore outer background connected to image boundaries
+        if x <= 0 or y <= 0 or (x + cw) >= w or (y + ch) >= h:
+            continue
+
+        mask_c = (labels == i)
+        pix = reference_rgb[mask_c]
+        p_mean = pix.mean(axis=0)
+        dist_bg = float(np.linalg.norm(p_mean - bg_mean))
+        is_skin = bool((p_mean[0] > p_mean[1] > p_mean[2]) and (p_mean[0] - p_mean[2] > 18))
+
+        # Decision rules:
+        # 1. Tiny voids (<= tiny_thresh): segmentation dropout within hair mass -> fill
+        # 2. Moderate voids (<= max_thresh) that are skin or distinct from studio background:
+        #    enclosed gaps showing skin or internal head -> fill
+        # 3. Loops matching background color (dist_bg < 35 and not is_skin):
+        #    legitimate curl loops and open spaces showing studio backdrop -> PRESERVE
+        # 4. Large voids (> max_thresh): legitimate open regions, face, or background -> PRESERVE
+        if area <= tiny_thresh:
+            fill_mask[mask_c] = 255
+            filled_components.append((i, area, "tiny_void"))
+        elif area <= max_thresh and (is_skin or dist_bg > 35.0):
+            fill_mask[mask_c] = 255
+            filled_components.append((i, area, "skin_forehead_pocket" if is_skin else "internal_gap"))
+        else:
+            preserved_components.append((i, area, dist_bg))
+
+    filled_binary = cv2.bitwise_or(binary, fill_mask)
+    info = {
+        "filled_count": len(filled_components),
+        "preserved_count": len(preserved_components),
+        "filled_pixels": int(np.count_nonzero(fill_mask)),
+        "filled_details": filled_components,
+    }
+    return filled_binary, fill_mask, info
+
+
 def compute_similarity_transform(
     src_landmarks_2d: np.ndarray,
     dst_landmarks_2d: np.ndarray,
@@ -148,7 +238,9 @@ def compute_similarity_transform(
     Compute a validated similarity transform (scale + rotation + translation)
     mapping source (reference) landmarks to destination (target) landmarks.
 
-    Uses cv2.estimateAffinePartial2D with RANSAC for robustness.
+    Uses cv2.estimateAffinePartial2D with scale-independent RANSAC threshold
+    normalized by target Interocular Distance (IOD) for robustness across
+    arbitrary portrait resolutions.
 
     Returns:
         dict with:
@@ -159,6 +251,7 @@ def compute_similarity_transform(
             - 'inliers': int
             - 'confidence': float (inlier ratio)
             - 'rejection_reason': str or None
+            - 'details': dict with IOD, NME, residuals
     """
     result = {
         "valid": False,
@@ -168,6 +261,7 @@ def compute_similarity_transform(
         "inliers": 0,
         "confidence": 0.0,
         "rejection_reason": None,
+        "details": {},
     }
 
     # Filter anchor indices to those within bounds for both arrays
@@ -201,11 +295,21 @@ def compute_similarity_transform(
         )
         return result
 
+    # Scale-independent RANSAC threshold based on target Interocular Distance (IOD)
+    if len(dst_landmarks_2d) > 263:
+        dst_iod = float(np.linalg.norm(dst_landmarks_2d[33] - dst_landmarks_2d[263]))
+    else:
+        dst_iod = float(np.linalg.norm(dst_pts.max(axis=0) - dst_pts.min(axis=0)) * 0.5)
+    dst_iod = max(20.0, dst_iod)
+
+    # Scale-independent RANSAC threshold: 6% of target IOD (e.g. ~31.7px on 2048x2048, ~8px on 512x512)
+    reproj_thresh = max(8.0, 0.06 * dst_iod)
+
     # Estimate similarity transform with RANSAC
     M, inlier_mask = cv2.estimateAffinePartial2D(
         src_pts, dst_pts,
         method=cv2.RANSAC,
-        ransacReprojThreshold=8.0,
+        ransacReprojThreshold=reproj_thresh,
         maxIters=2000,
         confidence=0.99,
     )
@@ -224,6 +328,15 @@ def compute_similarity_transform(
     tx = float(M[0, 2])
     ty = float(M[1, 2])
 
+    # Normalized Mean Reprojection Error (NME)
+    ones = np.ones((len(src_pts), 1), dtype=np.float32)
+    src_homo = np.hstack([src_pts, ones])
+    reprojected = src_homo @ M.T
+    residuals = np.linalg.norm(reprojected - dst_pts, axis=1)
+    inlier_residuals = residuals[inlier_mask.ravel() > 0]
+    mean_residual = float(np.mean(inlier_residuals)) if len(inlier_residuals) > 0 else 999.0
+    nme = mean_residual / dst_iod
+
     result["mode"] = "similarity"
     result["matrix"] = M
     result["scale"] = scale
@@ -232,6 +345,13 @@ def compute_similarity_transform(
     result["ty"] = ty
     result["inliers"] = inliers
     result["confidence"] = confidence
+    result["details"] = {
+        "dst_iod": dst_iod,
+        "reproj_thresh_px": reproj_thresh,
+        "mean_inlier_residual_px": mean_residual,
+        "nme": nme,
+        "total_points": len(src_pts),
+    }
 
     # ── Validation gates ──
 
@@ -261,8 +381,15 @@ def compute_similarity_transform(
         )
         return result
 
+    if nme > 0.15:
+        result["rejection_reason"] = (
+            f"Excessive normalized reprojection error: {nme:.3f} > 0.15"
+        )
+        return result
+
     result["valid"] = True
     return result
+
 
 
 # ─── Fallback Transform ──────────────────────────────────────────────
@@ -516,6 +643,25 @@ def build_facial_protection_mask(
         identity_protection = np.maximum(identity_protection, lm_hulls)
         face_feat_mask = np.maximum(face_feat_mask, lm_hulls)
 
+        # Lower face anatomical polygon: protects cheek skin and jawline
+        # from tragus 234 down around chin 152 to tragus 454 and across brow arch
+        valid_jaw = [pts[i] for i in JAWLINE_CONTOUR_INDICES if i < len(pts)]
+        valid_brow = [pts[i] for i in BROW_ARCH_INDICES if i < len(pts)]
+        if len(valid_jaw) >= 10 and len(valid_brow) >= 8:
+            poly = np.vstack([valid_jaw, valid_brow])
+            face_poly_mask = np.zeros((h, w), dtype=np.uint8)
+            cv2.fillPoly(face_poly_mask, [poly], 255)
+            # Erode face polygon slightly so hair can naturally frame the temples/cheeks
+            iod = float(np.linalg.norm(lms[33] - lms[263])) if len(lms) > 263 else float(w * 0.25)
+            erode_px = max(3, int(round(iod * 0.03)))
+            if erode_px % 2 == 0:
+                erode_px += 1
+            k_poly = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (erode_px, erode_px))
+            face_poly_eroded = cv2.erode(face_poly_mask, k_poly, iterations=1)
+
+            identity_protection = np.maximum(identity_protection, face_poly_eroded)
+            face_feat_mask = np.maximum(face_feat_mask, face_poly_eroded)
+
         # Dilate landmark / facial protections only — do not expand tight ear protection
         face_feat_mask = cv2.dilate(face_feat_mask, kernel, iterations=1)
         hard_protection = np.maximum(face_feat_mask, ear_protection)
@@ -641,14 +787,14 @@ def harmonize_hair_color(
     target_rgb: np.ndarray,
     target_hair_mask_np: np.ndarray,
     strength: float = 0.40,
+    target_segmentation_map: Optional[np.ndarray] = None,
+    target_landmarks: Optional[Dict[str, Any]] = None,
 ) -> np.ndarray:
     """
     Match color and lighting temperature of aligned reference hair to target in CIE LAB space.
     Restrained matching preserves donor hair curl texture, highlights, and fine strands while
     harmonizing overall lightness and tone with the target portrait lighting.
     """
-    # Restrict harmonization statistics and color transfer strictly to core interior hair
-    # (alpha > 0.65) to prevent amplifying background fringe/halos at delicate boundary strands.
     core_indices = aligned_hair_alpha > 0.65
     if not np.any(core_indices):
         return aligned_hair_rgb.copy()
@@ -661,35 +807,187 @@ def harmonize_hair_color(
     tgt_lab = cv2.cvtColor(tgt_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
 
     tgt_hair_indices = target_hair_mask_np > 128
-    if np.count_nonzero(tgt_hair_indices) > 50:
+    has_target_hair = np.count_nonzero(tgt_hair_indices) > 50
+
+    if has_target_hair:
         tgt_sample = tgt_lab[tgt_hair_indices]
+        ref_sample = ref_lab[core_indices]
+
+        result_lab = ref_lab.copy()
+        for ch in range(3):
+            m_tgt = float(tgt_sample[:, ch].mean())
+            s_tgt = float(max(1e-3, tgt_sample[:, ch].std()))
+
+            m_ref = float(ref_sample[:, ch].mean())
+            s_ref = float(max(1e-3, ref_sample[:, ch].std()))
+
+            # Restrained ratio prevents blowing out contrast
+            ratio = np.clip(s_tgt / s_ref, 0.75, 1.25)
+            matched = (ref_lab[:, :, ch] - m_ref) * ratio + m_tgt
+            result_lab[:, :, ch] = np.where(
+                core_indices,
+                (1.0 - strength) * ref_lab[:, :, ch] + strength * matched,
+                ref_lab[:, :, ch],
+            )
     else:
-        # Fallback to upper 40% of portrait if target has minimal hair
-        h = target_rgb.shape[0]
-        tgt_sample = tgt_lab[: int(h * 0.4), :]
+        # Target has no/minimal hair (e.g. Stage 2 bald base portrait).
+        # Harmonize lighting exposure and color temperature from target facial/scalp skin,
+        # preserving the hair's authentic tonal curve, highlights, and deep shadows.
+        skin_sample = None
+        if target_segmentation_map is not None:
+            # Face and scalp skin (Class 1)
+            skin_mask = (target_segmentation_map == 1)
+            if np.count_nonzero(skin_mask) > 100:
+                skin_sample = tgt_lab[skin_mask]
 
-    ref_sample = ref_lab[core_indices]
+        if skin_sample is None:
+            # Fallback to central face region from geometry
+            h, w = target_rgb.shape[:2]
+            skin_sample = tgt_lab[int(h * 0.25):int(h * 0.70), int(w * 0.25):int(w * 0.75)].reshape(-1, 3)
 
-    result_lab = ref_lab.copy()
-    for ch in range(3):
-        m_tgt = float(tgt_sample[:, ch].mean())
-        s_tgt = float(max(1e-3, tgt_sample[:, ch].std()))
+        ref_sample = ref_lab[core_indices]
+        result_lab = ref_lab.copy()
 
-        m_ref = float(ref_sample[:, ch].mean())
-        s_ref = float(max(1e-3, ref_sample[:, ch].std()))
+        # Target ambient lighting temperature from skin chromaticity
+        # Skin chromaticity (a*, b*) reflects the ambient lighting warmth/coolness.
+        m_skin_a = float(skin_sample[:, 1].mean())
+        m_skin_b = float(skin_sample[:, 2].mean())
 
-        # Restrained ratio prevents blowing out contrast
-        ratio = np.clip(s_tgt / s_ref, 0.75, 1.25)
-        matched = (ref_lab[:, :, ch] - m_ref) * ratio + m_tgt
-        result_lab[:, :, ch] = np.where(
-            core_indices,
-            (1.0 - strength) * ref_lab[:, :, ch] + strength * matched,
-            ref_lab[:, :, ch],
-        )
+        # Ambient chromatic shift (warm vs cool light)
+        delta_a = float(np.clip(m_skin_a - 14.0, -10.0, 10.0) * 0.25 * strength)
+        delta_b = float(np.clip(m_skin_b - 16.0, -12.0, 12.0) * 0.25 * strength)
+
+        # Ambient exposure shift (adjust L gently without crushing contrast or blowing highlights)
+        skin_l = float(skin_sample[:, 0].mean())
+        l_offset = float(np.clip((skin_l - 62.0) * 0.20 * strength, -15.0, 15.0))
+
+        result_lab[core_indices, 0] = np.clip(ref_lab[core_indices, 0] + l_offset, 0, 255)
+        result_lab[core_indices, 1] = np.clip(ref_lab[core_indices, 1] + delta_a, 0, 255)
+        result_lab[core_indices, 2] = np.clip(ref_lab[core_indices, 2] + delta_b, 0, 255)
 
     result_lab = np.clip(result_lab, 0, 255).astype(np.uint8)
     result_bgr = cv2.cvtColor(result_lab, cv2.COLOR_LAB2BGR)
     return cv2.cvtColor(result_bgr, cv2.COLOR_BGR2RGB)
+
+
+class CompositeResult(tuple):
+    """
+    Two-tuple of (pasted_composite_rgb, effective_alpha) for full backwards compatibility,
+    augmented with shadow_map attribute.
+    """
+    def __new__(cls, pasted_composite_rgb: np.ndarray, effective_alpha: np.ndarray, shadow_map: Optional[np.ndarray] = None):
+        return super().__new__(cls, (pasted_composite_rgb, effective_alpha))
+
+    def __init__(self, pasted_composite_rgb: np.ndarray, effective_alpha: np.ndarray, shadow_map: Optional[np.ndarray] = None):
+        self.pasted_composite_rgb = pasted_composite_rgb
+        self.effective_alpha = effective_alpha
+        self.shadow_map = shadow_map
+
+
+def apply_contact_shadow(
+    target_rgb: np.ndarray,
+    hair_alpha: np.ndarray,
+    target_segmentation_map: Optional[np.ndarray] = None,
+    target_landmarks: Optional[Dict[str, Any]] = None,
+    identity_protection: Optional[np.ndarray] = None,
+    shadow_strength: float = 0.25,
+    blur_sigma_scale: float = 1.0,
+    vertical_offset_px: Optional[int] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Apply subtle physical ambient contact occlusion shadow directly beneath overlapping donor hair onto forehead skin.
+
+    Guarantees:
+    - Shadow is a separate compositing layer derived from donor alpha.
+    - Strictly clipped to visible forehead/temple skin (Class 1).
+    - Never adds fake shadow on empty background wall, eyes, eyebrows, or non-overlapping hair.
+    - Offset and blur scale proportionally with image resolution.
+    - Multiplicative darkening is subtle (default 25% max darkening).
+
+    Returns:
+        (shadowed_target_rgb, shadow_map):
+            shadowed_target_rgb: (H, W, 3) uint8 image
+            shadow_map: (H, W) float32 in [0, 1]
+    """
+    h, w = target_rgb.shape[:2]
+    if shadow_strength <= 0.0:
+        return target_rgb.copy(), np.zeros((h, w), dtype=np.float32)
+
+    alpha = hair_alpha
+    if alpha.shape[:2] != (h, w):
+        alpha = cv2.resize(alpha, (w, h), interpolation=cv2.INTER_LINEAR)
+    alpha = np.clip(alpha, 0.0, 1.0).astype(np.float32)
+
+    scale = max(h, w) / 512.0
+    if vertical_offset_px is None:
+        offset_y = max(1, int(round(2.5 * scale)))
+    else:
+        offset_y = max(0, int(round(vertical_offset_px * scale)))
+
+    if offset_y > 0 and offset_y < h:
+        shifted_alpha = np.zeros_like(alpha)
+        shifted_alpha[offset_y:, :] = alpha[:-offset_y, :]
+    else:
+        shifted_alpha = alpha.copy()
+
+    # Narrow contact boundary: positive only immediately beneath terminating hair strands
+    shadow_raw = shifted_alpha * np.clip(1.0 - alpha, 0.0, 1.0)
+
+    # Gaussian blur for soft natural falloff
+    k_size = max(3, int(round(5 * scale * blur_sigma_scale)))
+    if k_size % 2 == 0:
+        k_size += 1
+    sigma = max(0.8, 1.2 * scale * blur_sigma_scale)
+    shadow_blur = cv2.GaussianBlur(shadow_raw, (k_size, k_size), sigmaX=sigma, sigmaY=sigma)
+
+    # Strictly clip to visible forehead / temple skin
+    skin_mask = np.zeros((h, w), dtype=bool)
+    if target_segmentation_map is not None:
+        seg = target_segmentation_map
+        if seg.shape[:2] != (h, w):
+            seg = cv2.resize(seg, (w, h), interpolation=cv2.INTER_NEAREST)
+        skin_mask = (seg == 1)  # Face & scalp skin
+    elif target_landmarks and target_landmarks.get("detected"):
+        lms = target_landmarks["landmarks_2d"]
+        valid_jaw = [lms[i] for i in JAWLINE_CONTOUR_INDICES if i < len(lms)]
+        valid_brow = [lms[i] for i in BROW_ARCH_INDICES if i < len(lms)]
+        if len(valid_jaw) >= 10 and len(valid_brow) >= 8:
+            poly = np.vstack([valid_jaw, valid_brow]).astype(np.int32)
+            cv2_skin = np.zeros((h, w), dtype=np.uint8)
+            cv2.fillPoly(cv2_skin, [poly], 255)
+            skin_mask = cv2_skin > 0
+        else:
+            skin_mask = np.ones((h, w), dtype=bool)
+    else:
+        skin_mask = np.ones((h, w), dtype=bool)
+
+    # Eyebrow / eye protection: do not allow shadow below the eyebrow arch
+    if target_landmarks and target_landmarks.get("detected"):
+        lms = target_landmarks["landmarks_2d"]
+        brow_indices = [70, 105, 63, 300, 334, 296]
+        valid_b = [lms[i][1] for i in brow_indices if i < len(lms)]
+        if valid_b:
+            brow_y_limit = float(np.min(valid_b)) + max(2.0, 4.0 * scale)
+            skin_mask[int(brow_y_limit):, :] = False
+
+    if identity_protection is not None:
+        ident = identity_protection
+        if ident.shape[:2] != (h, w):
+            ident = cv2.resize(ident, (w, h), interpolation=cv2.INTER_NEAREST)
+        skin_mask[ident > 0] = False
+
+    if target_segmentation_map is not None:
+        # Zero out background wall
+        skin_mask[seg == 0] = False
+
+    shadow_map = np.zeros((h, w), dtype=np.float32)
+    shadow_map[skin_mask] = shadow_blur[skin_mask]
+    shadow_map = np.clip(shadow_map * float(np.clip(shadow_strength, 0.0, 1.0)), 0.0, 1.0).astype(np.float32)
+
+    # Ambient occlusion darkening
+    shadow_factor = (1.0 - shadow_map)[..., None]
+    shadowed_target = np.clip(target_rgb.astype(np.float32) * shadow_factor, 0, 255).astype(np.uint8)
+    return shadowed_target, shadow_map
 
 
 def composite_aligned_hair(
@@ -698,16 +996,21 @@ def composite_aligned_hair(
     aligned_hair_alpha: np.ndarray,
     hard_protection: Optional[np.ndarray] = None,
     soft_transition_px: float = 3.0,
-) -> Tuple[np.ndarray, np.ndarray]:
+    ear_mask: Optional[np.ndarray] = None,
+    contact_shadow_strength: float = 0.25,
+    target_segmentation_map: Optional[np.ndarray] = None,
+    target_landmarks: Optional[Dict[str, Any]] = None,
+    identity_protection: Optional[np.ndarray] = None,
+) -> CompositeResult:
     """
-    Composite aligned reference hair onto target image with facial feature protection.
-    Uses fractional smoothly-weighted transitions outside hard protection to prevent
-    sharp 1-pixel binary boundary steps.
+    Composite aligned reference hair onto target image with facial feature protection
+    and physical contact occlusion shadowing beneath overlapping hair strands.
 
     Returns:
-        (pasted_composite_rgb, effective_alpha):
+        CompositeResult (unpacks as (pasted_composite_rgb, effective_alpha)):
             pasted_composite_rgb: (H, W, 3) uint8 composite image
             effective_alpha: (H, W) float32 in [0, 1]
+            .shadow_map: (H, W) float32 in [0, 1] contact shadow map
     """
     h, w = target_rgb.shape[:2]
     hair_rgb = aligned_hair_rgb
@@ -719,25 +1022,49 @@ def composite_aligned_hair(
         hair_alpha = cv2.resize(hair_alpha, (w, h), interpolation=cv2.INTER_LINEAR)
 
     alpha = np.clip(hair_alpha, 0.0, 1.0).astype(np.float32)
+
+    # 1. Apply ambient contact shadow onto skin beneath overlapping strands
+    if contact_shadow_strength > 0.0:
+        target_base, shadow_map = apply_contact_shadow(
+            target_rgb=target_rgb,
+            hair_alpha=alpha,
+            target_segmentation_map=target_segmentation_map,
+            target_landmarks=target_landmarks,
+            identity_protection=identity_protection if identity_protection is not None else hard_protection,
+            shadow_strength=contact_shadow_strength,
+        )
+    else:
+        target_base = target_rgb.copy()
+        shadow_map = np.zeros((h, w), dtype=np.float32)
+
     if hard_protection is not None:
         if hard_protection.shape[:2] != (h, w):
             hard_protection = cv2.resize(hard_protection, (w, h), interpolation=cv2.INTER_NEAREST)
-        # Strictly zero out alpha inside hard protection (100% bit-exact facial & ear protection)
-        alpha[hard_protection > 0] = 0.0
+
+        # When ear_mask is present, exclude ears from soft dissolve so genuine curls
+        # naturally frame and fall over/behind the ears without artificial gaps.
+        face_hard = hard_protection.copy()
+        if ear_mask is not None and np.any(ear_mask > 0):
+            if ear_mask.shape[:2] != (h, w):
+                ear_mask = cv2.resize(ear_mask, (w, h), interpolation=cv2.INTER_NEAREST)
+            face_hard[ear_mask > 0] = 0
 
         # Fractional smoothly-weighted transition in narrow adjacent hair rim
-        if soft_transition_px > 0.0 and np.any(hard_protection > 0):
-            dist_outside = cv2.distanceTransform((hard_protection == 0).astype(np.uint8), cv2.DIST_L2, 5)
+        if soft_transition_px > 0.0 and np.any(face_hard > 0):
+            dist_outside = cv2.distanceTransform((face_hard == 0).astype(np.uint8), cv2.DIST_L2, 5)
             smooth_weight = np.clip(dist_outside / float(soft_transition_px), 0.0, 1.0).astype(np.float32)
             alpha = alpha * smooth_weight
 
+        # Strictly zero out alpha inside face_hard (100% bit-exact facial protection)
+        alpha[face_hard > 0] = 0.0
+
     alpha_3ch = alpha[..., None]
     composite = (
-        target_rgb.astype(np.float32) * (1.0 - alpha_3ch) +
+        target_base.astype(np.float32) * (1.0 - alpha_3ch) +
         hair_rgb.astype(np.float32) * alpha_3ch
     ).clip(0, 255).astype(np.uint8)
 
-    return composite, alpha
+    return CompositeResult(composite, alpha, shadow_map)
 
 
 def _fill_mask_holes(mask: np.ndarray) -> np.ndarray:
@@ -767,25 +1094,24 @@ def build_edge_repair_mask(
     donor_coverage_threshold: float = 0.85,
     identity_protection: Optional[np.ndarray] = None,
     buffer_protection: Optional[np.ndarray] = None,
+    target_segmentation_map: Optional[np.ndarray] = None,
+    target_landmarks: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Image.Image, np.ndarray]:
     """
-    Build a dedicated, narrow edge-repair mask around the hairstyle boundary.
+    Build a dedicated, narrow edge-repair mask around the internal hairline seam.
 
     Guarantees:
     1. The central hair texture and curl pattern from the reference composite are EXCLUDED
        from inpainting (their mask value is 0), so diffusion does NOT repaint them.
-    2. The boundary ribbon (hairline seam, uncovered old hair) is INCLUDED (255) for inpainting.
-    3. The boundary band is strictly bounded within the hair envelope to prevent spilling
-       outward into the background around ears and side curls (preventing pale gray halos).
-    4. Any uncovered old target hair sticking out around the new hairstyle or covered only
-       by semi-transparent donor strands (alpha < donor_coverage_threshold) is INCLUDED (255)
-       so diffusion can remove it without leaving old curls underneath.
+    2. Outer curls and hair silhouettes against empty background wall are STRICTLY EXCLUDED (0)
+       (preserving 100% authentic photographic curls and eliminating glassy/bubbly rings).
+    3. The repair ribbon is strictly bounded to the internal intersection between donor hair
+       roots and the target head/scalp/forehead interface (hairline seam, temples, sideburns).
+    4. Uncovered old hair removal is enabled ONLY when genuine residual hair (> 500 px) is
+       present in target_hair_mask_np, preventing hallucinated inpainting on clean bald bases.
     5. Identity Protection: Genuine ear cartilage, facial features (eyes, eyebrows, nose, mouth),
        and clothing are STRICTLY and UNCONDITIONALLY EXCLUDED (0) under all inputs.
-    6. Buffer Protection: Dilated feature/ear margins block non-hair inpainting bleed onto skin,
-       while permitting genuine uncovered old-hair pixels inside the buffer to be repaired.
-    7. Contiguous Seam: boundary_band is closed via morphological closing and enclosed voids
-       are filled to eliminate fragmented micro-islands and isolated dark spots.
+    6. Buffer Protection: Dilated feature/ear margins block non-hair inpainting bleed onto skin.
 
     Returns:
         (edge_repair_mask_pil, edge_repair_mask_np)
@@ -805,7 +1131,37 @@ def build_edge_repair_mask(
         w_px += 1
     k_band = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (w_px, w_px))
 
-    # A. Hair silhouette boundaries
+    # A. Determine genuine target hair and permitted interface region
+    residual_hair_count = int(np.count_nonzero(tgt_mask > 128))
+    has_genuine_target_hair = residual_hair_count > 500
+
+    # Permitted interface: only regions where donor hair interfaces with target head / scalp / skin / neck
+    target_person_mask = np.zeros((h, w), dtype=np.uint8)
+    if target_segmentation_map is not None:
+        seg = target_segmentation_map
+        if seg.shape[:2] != (h, w):
+            seg = cv2.resize(seg, (w, h), interpolation=cv2.INTER_NEAREST)
+        # Person classes: face skin (1), facial features (2-13), neck (14), neck_l (15), cloth (16)
+        target_person_mask = np.isin(seg, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]).astype(np.uint8) * 255
+    elif hard_protection is not None and np.any(hard_protection > 0):
+        target_person_mask = hard_protection.copy()
+
+    if has_genuine_target_hair:
+        target_person_mask = np.maximum(target_person_mask, (tgt_mask > 128).astype(np.uint8) * 255)
+
+    if np.any(target_person_mask > 0):
+        k_inter = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (w_px, w_px))
+        permitted_interface = cv2.dilate(target_person_mask, k_inter, iterations=1)
+        if target_segmentation_map is not None:
+            # Strictly zero out background wall beyond w_px transition margin
+            dist_from_person = cv2.distanceTransform((target_person_mask == 0).astype(np.uint8), cv2.DIST_L2, 5)
+            bg_mask = (seg == 0)
+            permitted_interface[bg_mask & (dist_from_person > float(w_px))] = 0
+    else:
+        # Fallback for synthetic unit tests with no person or landmarks provided
+        permitted_interface = np.full((h, w), 255, dtype=np.uint8)
+
+    # B. Hair silhouette boundaries
     hair_core = (alpha >= donor_coverage_threshold).astype(np.uint8) * 255
     hair_footprint = (alpha > 0.15).astype(np.uint8) * 255
 
@@ -814,14 +1170,9 @@ def build_edge_repair_mask(
     eroded_core = cv2.erode(hair_core, k_band, iterations=1)
     boundary_band = cv2.subtract(dilated_footprint, eroded_core)
 
-    # Bounded envelope: ensure boundary band stays within hair/target interface
-    # and does not expand far out into empty studio background around ears/curls
-    k_env_size = max(3, int(round(w_px * 0.5)))
-    if k_env_size % 2 == 0:
-        k_env_size += 1
-    k_env = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_env_size, k_env_size))
-    hair_envelope = cv2.dilate(((tgt_mask > 128) | (alpha > 0.15)).astype(np.uint8) * 255, k_env, iterations=1)
-    boundary_band = cv2.bitwise_and(boundary_band, hair_envelope)
+    # Strictly confine boundary band to permitted head interface
+    # This completely eliminates outer silhouette curls in empty background wall
+    boundary_band = cv2.bitwise_and(boundary_band, permitted_interface)
 
     # Morphological CLOSE pass to merge fragmented micro-islands on curly/thin hair
     k_close_size = max(5, int(round(w_px * 0.4)))
@@ -830,28 +1181,30 @@ def build_edge_repair_mask(
     close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_close_size, k_close_size))
     boundary_band = cv2.morphologyEx(boundary_band, cv2.MORPH_CLOSE, close_kernel, iterations=1)
     boundary_band = _fill_mask_holes(boundary_band)
-    boundary_band = cv2.bitwise_and(boundary_band, hair_envelope)
+    boundary_band = cv2.bitwise_and(boundary_band, permitted_interface)
 
-    # B. Uncovered old target hair (where target had hair, but new hairstyle doesn't cover it reliably)
-    old_hair = (tgt_mask > 128).astype(np.uint8) * 255
-    covered_by_new = (alpha >= donor_coverage_threshold).astype(np.uint8) * 255
-    uncovered_old_hair = cv2.subtract(old_hair, covered_by_new)
-
-    # Scale-aware transition margin around uncovered old hair for seamless blending
-    if np.any(uncovered_old_hair > 0):
-        k_old_size = max(3, int(round(w_px * 0.4)))
-        if k_old_size % 2 == 0:
-            k_old_size += 1
-        k_old = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_old_size, k_old_size))
-        uncovered_old_hair_expanded = cv2.dilate(uncovered_old_hair, k_old, iterations=1)
-        uncovered_old_hair_expanded = cv2.bitwise_and(uncovered_old_hair_expanded, hair_envelope)
+    # C. Uncovered old target hair: enabled ONLY when genuine residual hair was detected
+    if has_genuine_target_hair:
+        old_hair = (tgt_mask > 128).astype(np.uint8) * 255
+        covered_by_new = (alpha >= donor_coverage_threshold).astype(np.uint8) * 255
+        uncovered_old_hair = cv2.subtract(old_hair, covered_by_new)
+        if np.any(uncovered_old_hair > 0):
+            k_old_size = max(3, int(round(w_px * 0.4)))
+            if k_old_size % 2 == 0:
+                k_old_size += 1
+            k_old = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_old_size, k_old_size))
+            uncovered_old_hair_expanded = cv2.dilate(uncovered_old_hair, k_old, iterations=1)
+            uncovered_old_hair_expanded = cv2.bitwise_and(uncovered_old_hair_expanded, permitted_interface)
+        else:
+            uncovered_old_hair_expanded = np.zeros((h, w), dtype=np.uint8)
     else:
-        uncovered_old_hair_expanded = uncovered_old_hair
+        uncovered_old_hair = np.zeros((h, w), dtype=np.uint8)
+        uncovered_old_hair_expanded = np.zeros((h, w), dtype=np.uint8)
 
-    # C. Combine boundary seam + uncovered old hair
+    # D. Combine boundary seam + uncovered old hair
     combined_mask = np.maximum(boundary_band, uncovered_old_hair_expanded)
 
-    # D. Strictly protect central hair core (keep reference curls intact)
+    # E. Strictly protect central hair core (keep reference curls intact)
     central_protected_hair = cv2.subtract(eroded_core, uncovered_old_hair_expanded)
     combined_mask[central_protected_hair > 0] = 0
 
@@ -889,19 +1242,125 @@ def build_edge_repair_mask(
         else:
             buf_prot = ear_buffer
 
-    # E. Strictly protect identity (unconditionally zero out over real skin/ear/eye/mouth pixels)
+    # F. Strictly protect identity (unconditionally zero out over real skin/ear/eye/mouth pixels)
     if ident_prot is not None:
         combined_mask[ident_prot > 0] = 0
 
-    # F. Buffer protection: dilated safety margin around features and ears.
-    # Used only to keep diffusion from bleeding onto skin or studio backdrop.
-    # Crucially, uncovered old hair inside this buffer remains eligible for repair!
+    # G. Buffer protection: dilated safety margin around features and ears
     if buf_prot is not None:
-        combined_mask[(buf_prot > 0) & (uncovered_old_hair == 0)] = 0
+        combined_mask[(buf_prot > 0) & (uncovered_old_hair == 0) & (boundary_band == 0)] = 0
 
     edge_mask_np = (combined_mask > 128).astype(np.uint8) * 255
     edge_mask_pil = Image.fromarray(edge_mask_np, mode="L")
     return edge_mask_pil, edge_mask_np
+
+
+def validate_edge_repair_mask(
+    edge_repair_mask_np: np.ndarray,
+    aligned_hair_alpha: np.ndarray,
+    target_segmentation_map: Optional[np.ndarray] = None,
+    identity_protection: Optional[np.ndarray] = None,
+    max_area_ratio: float = 0.20,
+    max_outer_bg_ratio: float = 0.05,
+) -> Dict[str, Any]:
+    """
+    Validate edge repair mask before Stable Diffusion inpainting.
+
+    Measures:
+    - repair_area_pct: fraction of canvas covered by inpainting mask
+    - identity_overlap_count: count of protected facial feature pixels inside mask
+    - outer_bg_overlap_pct: fraction of mask located out in empty background
+    - should_inpaint: whether diffusion should run
+    - is_valid: whether the mask satisfies all safety invariants
+    """
+    h, w = edge_repair_mask_np.shape[:2]
+    total_pixels = h * w
+    active_mask = (edge_repair_mask_np > 128)
+    active_pixels = int(np.count_nonzero(active_mask))
+    area_pct = round((active_pixels / total_pixels) * 100.0, 3)
+
+    ident_overlap = 0
+    if identity_protection is not None:
+        ident_overlap = int(np.count_nonzero(active_mask & (identity_protection > 0)))
+
+    outer_bg_pixels = 0
+    outer_bg_pct = 0.0
+    if target_segmentation_map is not None:
+        bg_mask = (target_segmentation_map == 0)
+        outer_bg_pixels = int(np.count_nonzero(active_mask & bg_mask))
+        if active_pixels > 0:
+            outer_bg_pct = round((outer_bg_pixels / active_pixels) * 100.0, 3)
+
+    is_valid = True
+    reasons = []
+
+    if ident_overlap > 0:
+        is_valid = False
+        reasons.append(f"Identity overlap violation: {ident_overlap} protected pixels in repair mask")
+
+    if (active_pixels / total_pixels) > max_area_ratio:
+        is_valid = False
+        reasons.append(f"Mask area too large: {area_pct}% exceeds {max_area_ratio*100}% threshold")
+
+    if (outer_bg_pct / 100.0) > max_outer_bg_ratio:
+        is_valid = False
+        reasons.append(f"Outer background overlap too large: {outer_bg_pct}% in empty background")
+
+    # If active_pixels == 0, pre-diffusion composite is already clean; diffusion is skipped safely
+    should_inpaint = is_valid and (active_pixels > 0)
+
+    sanitized_mask_np = edge_repair_mask_np.copy()
+    if identity_protection is not None:
+        sanitized_mask_np[identity_protection > 0] = 0
+
+    return {
+        "is_valid": is_valid,
+        "should_inpaint": should_inpaint,
+        "active_pixels": active_pixels,
+        "area_pct": area_pct,
+        "identity_overlap_count": ident_overlap,
+        "outer_bg_pixels": outer_bg_pixels,
+        "outer_bg_pct": outer_bg_pct,
+        "reasons": reasons,
+        "sanitized_mask_np": sanitized_mask_np,
+    }
+
+
+def create_repair_mask_validation_overlay(
+    target_rgb: np.ndarray,
+    edge_repair_mask_np: np.ndarray,
+    target_segmentation_map: Optional[np.ndarray] = None,
+    identity_protection: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """
+    Create a 3-channel visual diagnostic overlay of the repair mask validation.
+    - Green: Valid repair seam
+    - Blue outline: Target person boundary
+    - Yellow outline: Protected identity region
+    - Red: Mask pixels violating background or identity constraints
+    """
+    h, w = target_rgb.shape[:2]
+    overlay = target_rgb.copy().astype(np.float32)
+
+    active = edge_repair_mask_np > 128
+    bg_mask = (target_segmentation_map == 0) if target_segmentation_map is not None else np.zeros((h, w), dtype=bool)
+    ident_mask = (identity_protection > 0) if identity_protection is not None else np.zeros((h, w), dtype=bool)
+
+    invalid_mask = active & (bg_mask | ident_mask)
+    valid_mask = active & (~invalid_mask)
+
+    # Tint valid repair seam in Green
+    overlay[valid_mask] = overlay[valid_mask] * 0.4 + np.array([0, 255, 0], dtype=np.float32) * 0.6
+    # Tint invalid mask in Red
+    overlay[invalid_mask] = overlay[invalid_mask] * 0.3 + np.array([255, 0, 0], dtype=np.float32) * 0.7
+
+    # Tint identity protection outline in Yellow
+    if np.any(ident_mask):
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        ident_edge = cv2.subtract(cv2.dilate(ident_mask.astype(np.uint8), k), ident_mask.astype(np.uint8)) > 0
+        overlay[ident_edge] = np.array([255, 255, 0], dtype=np.float32)
+
+    return np.clip(overlay, 0, 255).astype(np.uint8)
 
 
 # ─── Diagnostic Previews ─────────────────────────────────────────────
@@ -1062,6 +1521,7 @@ def align_reference_to_target(
     bounded_decontamination: bool = True,
     ring_radius_px: Optional[int] = None,
     donor_coverage_threshold: float = 0.85,
+    contact_shadow_strength: float = 0.25,
 ) -> Dict[str, Any]:
     """
     Full alignment pipeline: detect landmarks, compute transform, warp hair,
@@ -1148,8 +1608,15 @@ def align_reference_to_target(
     if pruned_count > 0:
         warnings.append(f"Pruned {pruned_count} false-positive backdrop pixels from reference hair mask.")
 
+    # ── Selective mask-hole cleanup ──
+    ref_hair_filled, fill_mask, fill_info = selective_fill_reference_mask_holes(
+        ref_hair_np_clean, reference_rgb, reference_landmarks
+    )
+    if fill_info["filled_count"] > 0:
+        warnings.append(f"Selectively filled {fill_info['filled_count']} internal mask holes ({fill_info['filled_pixels']} px).")
+
     # ── Build reference hair alpha (soft-edge) ──
-    ref_hair_binary = (ref_hair_np_clean > 128).astype(np.uint8)
+    ref_hair_binary = (ref_hair_filled > 128).astype(np.uint8)
     ref_hair_dist = cv2.distanceTransform(ref_hair_binary, cv2.DIST_L2, 5)
     ref_hair_alpha = np.clip(ref_hair_dist / 3.0, 0.0, 1.0).astype(np.float32)
 
@@ -1269,7 +1736,7 @@ def align_reference_to_target(
         iod = float(target_geom["interocular_dist"])
         edge_width_px = int(np.clip(round(iod * 0.12), 8, 20))
         feather_width_px = float(np.clip(round(iod * 0.06), 4.0, 10.0))
-        soft_transition_px = float(np.clip(round(iod * 0.03), 2.0, 5.0))
+        soft_transition_px = float(np.clip(round(iod * 0.025), 3.0, 6.0))
         cranial_expansion_px = int(np.clip(round(iod * 0.20), 12, 30))
     else:
         edge_width_px = 12
@@ -1279,13 +1746,14 @@ def align_reference_to_target(
         ear_mask_np = np.isin(target_segmentation_map, EAR_SEG_CLASSES).astype(np.uint8) * 255
 
     # ── Composite aligned reference hair directly onto target portrait ──
-    # Facial features are strictly protected; central curls stay 100% intact
+    # Facial features are strictly protected; genuine curls flow naturally around ears
     pasted_composite_np, effective_alpha = composite_aligned_hair(
         target_rgb=target_rgb,
         aligned_hair_rgb=harmonized_rgb,
-        aligned_hair_alpha=warped_alpha * transition_weight,
+        aligned_hair_alpha=warped_alpha,
         hard_protection=hard_protection,
         soft_transition_px=soft_transition_px,
+        ear_mask=ear_mask_np,
     )
 
     # ── Build dedicated narrow edge repair mask ──
@@ -1335,9 +1803,13 @@ def align_reference_to_target(
             Image.fromarray(decontaminated_rgb).save(p_dir / "decontaminated_reference.png")
             Image.fromarray((ref_hair_alpha * 255).astype(np.uint8)).save(p_dir / "reference_hair_alpha.png")
             Image.fromarray(unknown_region * 255).save(p_dir / "unknown_region_mask.png")
+            Image.fromarray(ref_hair_filled).save(p_dir / "reference_hair_mask_filled.png")
+            Image.fromarray(fill_mask).save(p_dir / "reference_hair_mask_holes.png")
             preview_paths["decontaminated_reference"] = str(p_dir / "decontaminated_reference.png")
             preview_paths["reference_hair_alpha"] = str(p_dir / "reference_hair_alpha.png")
             preview_paths["unknown_region_mask"] = str(p_dir / "unknown_region_mask.png")
+            preview_paths["reference_hair_mask_filled"] = str(p_dir / "reference_hair_mask_filled.png")
+            preview_paths["reference_hair_mask_holes"] = str(p_dir / "reference_hair_mask_holes.png")
         except Exception as exc:
             warnings.append(f"Could not save decontaminated reference preview: {exc}")
 
@@ -1355,6 +1827,9 @@ def align_reference_to_target(
         "buffer_protection": hard_protection,
         "decontaminated_reference_rgb": decontaminated_rgb,
         "reference_hair_alpha": ref_hair_alpha,
+        "reference_mask_filled": ref_hair_filled,
+        "reference_fill_mask": fill_mask,
+        "fill_info": fill_info,
         "unknown_region_mask": unknown_region,
         "transform_info": transform_info,
         "pose_info": pose_info,
