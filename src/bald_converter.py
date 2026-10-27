@@ -152,9 +152,9 @@ class BaldConverterConfig:
     backend: str = "auto"  # 'auto', 'sd-inpaint', or 'onnx'
     num_inference_steps: int = 12
     guidance_scale: float = 7.5
-    hair_mask_expansion_ratio: float = 0.035  # fraction of face_scale
-    max_hair_mask_expansion_px: int = 32
-    feather_width_px: float = 3.0
+    hair_mask_expansion_ratio: float = 0.06  # fraction of face_scale
+    max_hair_mask_expansion_px: int = 64
+    feather_width_px: float = 6.0
     prompt: str = (
         "Photorealistic portrait of the same person, clean smooth bald head, shaved bald head, "
         "completely bald scalp, natural scalp skin, smooth skin on top of head, shaved bald hairstyle. "
@@ -211,6 +211,10 @@ class BaldConversionResult:
     removal_overlay: Optional[Image.Image] = None
     headwear_mask: Optional[Image.Image] = None
     headwear_detected: bool = False
+    background_repair_mask: Optional[Image.Image] = None
+    background_repair_preview: Optional[Image.Image] = None
+    bald_base_before_after: Optional[Image.Image] = None
+    background_difference: Optional[Image.Image] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
     warnings: List[str] = field(default_factory=list)
 
@@ -289,6 +293,12 @@ def evaluate_stage1_quality_gate(
     elif edit_coverage_pct < 1.0:
         review_reasons.append(f"Extremely small edit mask coverage ({edit_coverage_pct:.2f}%)")
 
+    has_strand_texture, strand_diff = detect_leftover_strand_texture(
+        original_target, bald_base, edit_mask, ring_px=12
+    )
+    if has_strand_texture:
+        review_reasons.append(f"Residual hair strand texture detected outside edit mask (diff={strand_diff:.2f} > 8.0)")
+
     if failure_reasons:
         status = "FAILED"
     elif review_reasons:
@@ -305,9 +315,32 @@ def evaluate_stage1_quality_gate(
         "edit_pixels": edit_count,
         "headwear_detected": headwear_result.detected if headwear_result else False,
         "headwear_source": headwear_result.source if headwear_result else "none",
+        "leftover_strand_texture": {"detected": has_strand_texture, "diff": round(strand_diff, 2)},
         "failure_reasons": failure_reasons,
         "review_reasons": review_reasons,
     }
+
+
+def detect_leftover_strand_texture(
+    target_np: np.ndarray,
+    bald_np: np.ndarray,
+    edit_mask_np: np.ndarray,
+    ring_px: int = 12,
+) -> Tuple[bool, float]:
+    """Catches faint hair wisps the segmentation-based residual check misses,
+    by looking for texture/edge discontinuity in a ring just outside the
+    Stage-1 edit mask (where strands commonly get missed)."""
+    ring_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ring_px * 2 + 1, ring_px * 2 + 1))
+    outer_ring = cv2.dilate(edit_mask_np, ring_kernel) & ~edit_mask_np
+    if not np.any(outer_ring):
+        return False, 0.0
+    t_gray = cv2.cvtColor(target_np, cv2.COLOR_RGB2GRAY)
+    b_gray = cv2.cvtColor(bald_np, cv2.COLOR_RGB2GRAY)
+    t_edges = cv2.Laplacian(t_gray, cv2.CV_32F)
+    b_edges = cv2.Laplacian(b_gray, cv2.CV_32F)
+    ring_bool = outer_ring > 0
+    texture_diff = float(np.mean(np.abs(t_edges[ring_bool] - b_edges[ring_bool])))
+    return texture_diff > 8.0, texture_diff
 
 
 class BaldConverter(ABC):
@@ -325,6 +358,7 @@ class BaldConverter(ABC):
         face_landmarks: Optional[Dict[str, Any]] = None,
         headwear_mask: Optional[Union[str, Path, Image.Image, np.ndarray]] = None,
         seed: Optional[int] = None,
+        hair_prob: Optional[np.ndarray] = None,
     ) -> BaldConversionResult:
         """Perform hair and headwear removal and scalp generation."""
         pass
@@ -337,6 +371,7 @@ class BaldConverter(ABC):
         face_landmarks: Optional[Dict[str, Any]] = None,
         headwear_mask: Optional[Union[str, Path, Image.Image, np.ndarray]] = None,
         return_extended: bool = False,
+        hair_prob: Optional[np.ndarray] = None,
     ) -> Union[
         Tuple[Image.Image, Image.Image, Image.Image, Any, List[str]],
         Tuple[Image.Image, Image.Image, List[str]],
@@ -354,6 +389,23 @@ class BaldConverter(ABC):
         if hair_np.shape[:2] != (h, w):
             hair_np = cv2.resize(hair_np, (w, h), interpolation=cv2.INTER_NEAREST)
         hair_binary = (hair_np > 128).astype(np.uint8) * 255
+
+        # 2. Extract anatomical face geometry & scale
+        geom = compute_face_geometry(face_landmarks, w, h)
+        face_scale = geom["face_scale"]
+
+        # Soft-probability fringe catch: recover low-confidence wisps near existing hair
+        if hair_prob is not None:
+            if hair_prob.shape[:2] != (h, w):
+                hair_prob = cv2.resize(hair_prob, (w, h), interpolation=cv2.INTER_LINEAR)
+            low_conf_hair = (hair_prob > 0.25).astype(np.uint8) * 255
+            fringe_k_px = max(15, int(round(face_scale * 0.16))) | 1
+            near_existing_hair = cv2.dilate(
+                hair_binary, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (fringe_k_px, fringe_k_px))
+            )
+            fringe_catch = cv2.bitwise_and(low_conf_hair, near_existing_hair)
+            hair_binary = cv2.bitwise_or(hair_binary, fringe_catch)
+
         hair_px = int(np.count_nonzero(hair_binary))
 
         if hair_px == 0:
@@ -361,12 +413,8 @@ class BaldConverter(ABC):
         elif (hair_px / total_px) > 0.85:
             warnings.append(f"Target hair mask covers {(hair_px/total_px)*100:.1f}% of image.")
 
-        # 2. Extract anatomical face geometry & scale
-        geom = compute_face_geometry(face_landmarks, w, h)
-        face_scale = geom["face_scale"]
-
         # Scale-adaptive morphological margins (scaled to actual face size)
-        expansion_px = int(np.clip(face_scale * self.config.hair_mask_expansion_ratio, 4, self.config.max_hair_mask_expansion_px))
+        expansion_px = int(np.clip(face_scale * self.config.hair_mask_expansion_ratio, 8, self.config.max_hair_mask_expansion_px))
         eyebrow_dilation_px = int(np.clip(face_scale * 0.015, 2, 8))
         close_px = int(np.clip(face_scale * 0.040, 5, 25))
 
@@ -456,6 +504,174 @@ class BaldConverter(ABC):
         return edit_mask_pil, protection_mask_pil, warnings
 
 
+def repair_stage1_background(
+    target_np: np.ndarray,
+    raw_np: np.ndarray,
+    edit_np: np.ndarray,
+    prot_np: np.ndarray,
+    face_landmarks: Optional[Dict[str, Any]] = None,
+    target_segmentation_map: Optional[np.ndarray] = None,
+    feather_px: float = 10.0,
+) -> Tuple[np.ndarray, Image.Image, Image.Image, Image.Image, Image.Image, Dict[str, Any]]:
+    """
+    Separate Stage 1 edit region into scalp vs background repair region.
+    Reconstruct background with smooth delta field matching to eliminate ghost dome,
+    while preserving anatomical scalp and 100% bit-exact background outside edit mask.
+    """
+    h, w = target_np.shape[:2]
+
+    # 1. Distinguish head/scalp boundary from background wall
+    scalp_mask = np.zeros((h, w), dtype=np.uint8)
+    if face_landmarks and face_landmarks.get("detected"):
+        raw_pts = face_landmarks.get("landmarks_2d", [])
+        if len(raw_pts) >= 468:
+            pts = np.array(raw_pts, dtype=np.float32)
+            p_chin = pts[152]
+            p_brow = pts[168]
+            p_top_forehead = pts[10]
+            p_l_temple = pts[234]
+            p_r_temple = pts[454]
+
+            face_w = float(np.linalg.norm(p_l_temple - p_r_temple))
+            face_h = float(np.linalg.norm(p_chin - p_top_forehead))
+            center_x = float(p_brow[0])
+            center_y = float(p_brow[1] - 0.12 * face_h)
+            rx = int(0.62 * face_w)
+            ry = int(0.85 * face_h)
+
+            cranium_ellipse = np.zeros((h, w), dtype=np.uint8)
+            cv2.ellipse(cranium_ellipse, (int(center_x), int(center_y)), (rx, ry), 0, 0, 360, 255, -1)
+
+            # Sample forehead skin from target
+            forehead_pts = pts[[10, 67, 109, 108, 151, 337, 338, 297]]
+            fx = np.clip(forehead_pts[:, 0].astype(int), 0, w - 1)
+            fy = np.clip(forehead_pts[:, 1].astype(int), 0, h - 1)
+            skin_sample = target_np[fy, fx]
+            skin_med = np.median(skin_sample, axis=0)
+
+            target_ycrcb = cv2.cvtColor(raw_np, cv2.COLOR_RGB2YCrCb)
+            skin_ycrcb_ref = cv2.cvtColor(skin_med.reshape(1, 1, 3).astype(np.uint8), cv2.COLOR_RGB2YCrCb)[0, 0]
+            dist_chroma = np.linalg.norm(target_ycrcb[:, :, 1:].astype(float) - skin_ycrcb_ref[1:].astype(float), axis=-1)
+            is_skin = (dist_chroma < 35) & (raw_np[:, :, 0] > raw_np[:, :, 2])
+
+            scale_bg = face_h / 250.0 if face_h > 0 else max(h, w) / 512.0
+            k_ce_px = max(11, int(round(31 * scale_bg))) | 1
+            k_close1_px = max(17, int(round(51 * scale_bg))) | 1
+            k_close2_px = max(15, int(round(41 * scale_bg))) | 1
+
+            cranium_expanded = cv2.dilate(cranium_ellipse, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_ce_px, k_ce_px)))
+            scalp_skin = (is_skin & (cranium_expanded > 0) & (edit_np > 128)).astype(np.uint8) * 255
+            scalp_skin = cv2.morphologyEx(scalp_skin, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_close1_px, k_close1_px)))
+            cranium_in_edit = (cranium_ellipse > 0) & (edit_np > 128)
+            scalp_mask = (cranium_in_edit | (scalp_skin > 0)).astype(np.uint8) * 255
+            scalp_mask = cv2.morphologyEx(scalp_mask, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_close2_px, k_close2_px)))
+
+    if np.count_nonzero(scalp_mask) == 0:
+        if target_segmentation_map is not None:
+            seg = target_segmentation_map
+            if seg.shape[:2] != (h, w):
+                seg = cv2.resize(seg, (w, h), interpolation=cv2.INTER_NEAREST)
+            scalp_mask = ((seg == 1) & (edit_np > 128)).astype(np.uint8) * 255
+        else:
+            scalp_mask = (edit_np > 128).astype(np.uint8) * 255
+
+    # Background repair mask: inside edit mask, outside scalp, outside protection
+    bg_repair_mask = ((edit_np > 128) & (scalp_mask == 0) & (prot_np == 0)).astype(np.uint8) * 255
+    bg_px_count = int(np.count_nonzero(bg_repair_mask))
+
+    # Pre-compute blending alpha
+    dist = cv2.distanceTransform((edit_np > 128).astype(np.uint8), cv2.DIST_L2, 5)
+    blend_alpha = np.clip(dist / max(1.0, float(feather_px)), 0.0, 1.0).astype(np.float32)
+    blend_alpha[edit_np == 0] = 0.0
+    blend_alpha[prot_np > 0] = 0.0
+    blend_alpha_3ch = blend_alpha[..., None]
+
+    # Baseline composite before background repair
+    old_comp = (
+        target_np.astype(np.float32) * (1.0 - blend_alpha_3ch)
+        + raw_np.astype(np.float32) * blend_alpha_3ch
+    ).clip(0, 255).astype(np.uint8)
+    old_comp[edit_np == 0] = target_np[edit_np == 0]
+
+    repaired_raw = raw_np.copy()
+    delta_med = [0.0, 0.0, 0.0]
+
+    if bg_px_count > 0:
+        # Sample background delta along outer border of edit mask
+        scale_img = max(h, w) / 512.0
+        k_border_px = max(7, int(round(15 * scale_img))) | 1
+        k_near_px = max(13, int(round(31 * scale_img))) | 1
+        border_outer = cv2.dilate((edit_np > 128).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_RECT, (k_border_px, k_border_px))) - (edit_np > 128).astype(np.uint8)
+        near_bg = cv2.dilate(bg_repair_mask, cv2.getStructuringElement(cv2.MORPH_RECT, (k_near_px, k_near_px))) > 0
+        sample_mask = (border_outer > 0) & near_bg
+        min_samples = max(10, int(round(20 * scale_img)))
+        if np.count_nonzero(sample_mask) < min_samples:
+            sample_mask = border_outer > 0
+
+        delta_sample = target_np.astype(np.float32) - raw_np.astype(np.float32)
+        delta_field_init = np.zeros_like(target_np, dtype=np.float32)
+        delta_field_init[sample_mask] = delta_sample[sample_mask]
+        delta_med = np.median(delta_sample[sample_mask], axis=0).tolist()
+
+        # Smoothly interpolate delta field using downscaled Telea inpainting
+        down = 4
+        sw, sh = max(1, w // down), max(1, h // down)
+        small_delta = cv2.resize(delta_field_init, (sw, sh))
+        small_known = cv2.resize((sample_mask.astype(np.uint8) * 255), (sw, sh), interpolation=cv2.INTER_NEAREST)
+        small_unknown = cv2.resize(bg_repair_mask, (sw, sh), interpolation=cv2.INTER_NEAREST)
+
+        delta_u8 = np.clip(small_delta + 128.0, 0, 255).astype(np.uint8)
+        inpaint_mask = ((small_unknown > 0) & (small_known == 0)).astype(np.uint8) * 255
+        delta_inpainted_u8 = cv2.inpaint(delta_u8, inpaint_mask, 15, cv2.INPAINT_TELEA)
+        delta_field = cv2.resize(delta_inpainted_u8.astype(np.float32) - 128.0, (w, h), interpolation=cv2.INTER_CUBIC)
+
+        raw_bg_corrected = np.clip(raw_np.astype(np.float32) + delta_field, 0, 255).astype(np.uint8)
+        repaired_raw[bg_repair_mask > 0] = raw_bg_corrected[bg_repair_mask > 0]
+
+    # Composite with repaired background
+    new_comp = (
+        target_np.astype(np.float32) * (1.0 - blend_alpha_3ch)
+        + repaired_raw.astype(np.float32) * blend_alpha_3ch
+    ).clip(0, 255).astype(np.uint8)
+    new_comp[edit_np == 0] = target_np[edit_np == 0]
+
+    # Required Phase 1 Diagnostics:
+    # 1. stage1_background_repair_mask.png
+    bg_repair_mask_pil = Image.fromarray(bg_repair_mask, mode="L")
+
+    # 2. stage1_background_repair_preview.png (overlay on target image)
+    preview_np = target_np.copy()
+    overlay_color = np.array([0, 220, 255], dtype=np.uint8)
+    m_bool = bg_repair_mask > 0
+    preview_np[m_bool] = (preview_np[m_bool].astype(float) * 0.4 + overlay_color.astype(float) * 0.6).astype(np.uint8)
+    bg_repair_preview_pil = Image.fromarray(preview_np, mode="RGB")
+
+    # 3. stage1_bald_base_before_after.png
+    if h >= 400 and w >= 400:
+        y_start = max(0, int(h * 0.05))
+        y_end = min(h, int(h * 0.45))
+        x_start = max(0, int(w * 0.25))
+        x_end = min(w, int(w * 0.75))
+        crop_before = old_comp[y_start:y_end, x_start:x_end]
+        crop_after = new_comp[y_start:y_end, x_start:x_end]
+        sbs_crop = np.hstack([crop_before, crop_after])
+        bald_base_before_after_pil = Image.fromarray(sbs_crop, mode="RGB")
+    else:
+        bald_base_before_after_pil = Image.fromarray(np.hstack([old_comp, new_comp]), mode="RGB")
+
+    # 4. stage1_background_difference.png (10x amplified difference)
+    bg_diff = np.clip(np.abs(new_comp.astype(float) - old_comp.astype(float)) * 10.0, 0, 255).astype(np.uint8)
+    bg_difference_pil = Image.fromarray(bg_diff, mode="RGB")
+
+    info = {
+        "bg_repair_pixels": bg_px_count,
+        "scalp_pixels": int(np.count_nonzero(scalp_mask)),
+        "delta_median": delta_med,
+    }
+
+    return repaired_raw, bg_repair_mask_pil, bg_repair_preview_pil, bald_base_before_after_pil, bg_difference_pil, info
+
+
 class SDInpaintBaldConverter(BaldConverter):
     """Stage 1 Bald Converter powered by Stable Diffusion 1.5 Inpainting."""
 
@@ -479,6 +695,7 @@ class SDInpaintBaldConverter(BaldConverter):
         face_landmarks: Optional[Dict[str, Any]] = None,
         headwear_mask: Optional[Union[str, Path, Image.Image, np.ndarray]] = None,
         seed: Optional[int] = None,
+        hair_prob: Optional[np.ndarray] = None,
     ) -> BaldConversionResult:
         t0 = time.perf_counter()
         w_orig, h_orig = target_image.size
@@ -499,6 +716,7 @@ class SDInpaintBaldConverter(BaldConverter):
                 face_landmarks=face_landmarks,
                 headwear_mask=headwear_mask,
                 return_extended=True,
+                hair_prob=hair_prob,
             )
         )
 
@@ -590,13 +808,30 @@ class SDInpaintBaldConverter(BaldConverter):
         if raw_np.std() < 1e-2:
             raise ValueError("Stage 1 SD inpainting produced a solid/blank image.")
 
-        # Step 4: Strict masked compositing with scale-adaptive feather
+        # Step 4: Background repair & strict masked compositing with scale-adaptive feather
         target_np = np.asarray(target_rgb)
         prot_np = np.asarray(protection_mask_pil)
 
         geom = compute_face_geometry(face_landmarks, w_orig, h_orig)
         face_scale = geom["face_scale"]
-        feather = float(np.clip(face_scale * 0.010, 2.0, 10.0))
+        feather = float(np.clip(face_scale * 0.018, 6.0, 26.0))
+
+        (
+            repaired_raw_np,
+            bg_repair_mask_pil,
+            bg_repair_preview_pil,
+            bald_base_before_after_pil,
+            bg_diff_pil,
+            bg_repair_info,
+        ) = repair_stage1_background(
+            target_np=target_np,
+            raw_np=raw_np,
+            edit_np=edit_np,
+            prot_np=prot_np,
+            face_landmarks=face_landmarks,
+            target_segmentation_map=target_segmentation_map,
+            feather_px=feather,
+        )
 
         dist = cv2.distanceTransform((edit_np > 128).astype(np.uint8), cv2.DIST_L2, 5)
         blend_alpha = np.clip(dist / feather, 0.0, 1.0).astype(np.float32)
@@ -608,7 +843,7 @@ class SDInpaintBaldConverter(BaldConverter):
         blend_alpha_3ch = blend_alpha[..., None]
         composite_np = (
             target_np.astype(np.float32) * (1.0 - blend_alpha_3ch)
-            + raw_np.astype(np.float32) * blend_alpha_3ch
+            + repaired_raw_np.astype(np.float32) * blend_alpha_3ch
         ).clip(0, 255).astype(np.uint8)
 
         # Enforce exact bit preservation outside edit_mask
@@ -648,6 +883,7 @@ class SDInpaintBaldConverter(BaldConverter):
             "headwear_detected": hw_result.detected,
             "headwear_source": hw_result.source,
             "headwear_pixels": hw_result.pixel_count,
+            "background_repair": bg_repair_info,
         }
 
         if qg_metrics["status"] != "PASSED":
@@ -661,6 +897,10 @@ class SDInpaintBaldConverter(BaldConverter):
             removal_overlay=removal_overlay_pil,
             headwear_mask=hw_result.headwear_mask,
             headwear_detected=hw_result.detected,
+            background_repair_mask=bg_repair_mask_pil,
+            background_repair_preview=bg_repair_preview_pil,
+            bald_base_before_after=bald_base_before_after_pil,
+            background_difference=bg_diff_pil,
             metadata=metadata,
             warnings=warnings,
         )
@@ -701,6 +941,7 @@ class ONNXBaldConverter(BaldConverter):
         face_landmarks: Optional[Dict[str, Any]] = None,
         headwear_mask: Optional[Union[str, Path, Image.Image, np.ndarray]] = None,
         seed: Optional[int] = None,
+        hair_prob: Optional[np.ndarray] = None,
     ) -> BaldConversionResult:
         if self.session is None:
             raise RuntimeError("ONNXBaldConverter: Session is not initialized.")
@@ -715,6 +956,7 @@ class ONNXBaldConverter(BaldConverter):
                 face_landmarks=face_landmarks,
                 headwear_mask=headwear_mask,
                 return_extended=True,
+                hair_prob=hair_prob,
             )
         )
 

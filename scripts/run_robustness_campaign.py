@@ -51,6 +51,7 @@ from src.two_stage_transfer import (
     generate_two_stage_hairstyle_transfer,
     load_two_stage_config,
 )
+from src.image_preprocessing import load_and_validate_image
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("RobustnessCampaign")
@@ -107,12 +108,11 @@ def inspect_single_asset(p: Path, is_target: bool) -> Dict[str, Any]:
     }
 
     try:
-        with Image.open(p) as img:
-            info["readable"] = True
-            info["width"], info["height"] = img.size
-            info["color_mode"] = img.mode
-            info["format"] = img.format
-            img_rgb = img.convert("RGB")
+        img_rgb = load_and_validate_image(p)
+        info["readable"] = True
+        info["width"], info["height"] = img_rgb.size
+        info["color_mode"] = img_rgb.mode
+        info["format"] = p.suffix.lstrip(".").upper()
     except Exception as e:
         info["warnings"].append(f"Image open failure: {e}")
         return info
@@ -302,8 +302,8 @@ def run_phase_b_diagnostics(
         }
 
         try:
-            target_img = Image.open(t_path).convert("RGB")
-            ref_img = Image.open(r_path).convert("RGB")
+            target_img = load_and_validate_image(t_path)
+            ref_img = load_and_validate_image(r_path)
             w_t, h_t = target_img.size
             w_r, h_r = ref_img.size
             target_rgb = np.asarray(target_img)

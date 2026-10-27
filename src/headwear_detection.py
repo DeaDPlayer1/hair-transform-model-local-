@@ -181,7 +181,8 @@ def detect_headwear(
                             h_np = cv2.resize(h_np, (w, h), interpolation=cv2.INTER_NEAREST)
                         existing_hair_roi = h_np[y_start:y_end, x_start:x_end] > 128
 
-                    # Check for non-hair, non-skin, non-background cap structure
+                    # Check for non-hair, no
+                    # n-skin, non-background cap structure
                     # Backdrops in portraits are typically uniform, whereas hats have texture or distinct color
                     # Convert to HSV to detect hat color consistency
                     hsv_roi = cv2.cvtColor(roi_rgb, cv2.COLOR_RGB2HSV)
@@ -210,6 +211,17 @@ def detect_headwear(
                         existing_hair_roi.astype(np.uint8),
                         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31)),
                     ) > 0
+
+                    roi_gray = cv2.cvtColor(roi_rgb, cv2.COLOR_RGB2GRAY)
+                    texture_var = float(cv2.Laplacian(roi_gray, cv2.CV_32F).var())
+                    MIN_FABRIC_TEXTURE_VAR = 25.0  # flat walls/ceilings/shelving score well below
+                                                   # this; woven fabric (actual caps) scores above it
+                    if texture_var < MIN_FABRIC_TEXTURE_VAR:
+                        cap_candidates = np.zeros_like(cap_candidates)
+                        warnings.append(
+                            f"Heuristic headwear ROI rejected: texture variance {texture_var:.1f} "
+                            f"below fabric threshold — likely background clutter, not a hat."
+                        )
 
                     num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(cap_candidates)
                     headwear_roi = np.zeros_like(cap_candidates)

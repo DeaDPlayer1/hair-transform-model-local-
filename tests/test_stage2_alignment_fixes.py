@@ -35,7 +35,9 @@ class TestSelectiveHoleFilling:
         # Create tiny enclosed hole (area = 25 px)
         mask[200:205, 200:205] = 0
 
-        rgb = np.full((h, w, 3), 40, dtype=np.uint8)  # dark hair
+        rgb = np.full((h, w, 3), 180, dtype=np.uint8)  # studio backdrop
+        rgb[100:400, 100:400] = 40  # dark hair
+        rgb[200:205, 200:205] = 40  # dropped hair pixels inside hole
 
         filled, fill_mask, info = selective_fill_reference_mask_holes(mask, rgb)
         assert info["filled_count"] >= 1
@@ -83,8 +85,8 @@ class TestSelectiveHoleFilling:
         assert filled[160, 155] == 0
         assert info["preserved_count"] >= 1
 
-    def test_forehead_skin_pocket_filled(self):
-        """Gaps showing warm forehead skin inside hair fringe should be filled."""
+    def test_forehead_skin_pocket_preserved(self):
+        """Gaps showing warm forehead skin inside hair fringe should be preserved as natural openings."""
         h, w = 512, 512
         bg_color = np.array([180, 180, 180], dtype=np.uint8)  # Studio grey
         hair_color = np.array([45, 30, 20], dtype=np.uint8)
@@ -101,9 +103,10 @@ class TestSelectiveHoleFilling:
         rgb[220:240, 200:215] = skin_color
 
         filled, fill_mask, info = selective_fill_reference_mask_holes(mask, rgb)
-        # Skin pocket should be filled
-        assert filled[230, 205] == 255
-        assert fill_mask[230, 205] == 255
+        # Skin pocket should be preserved (not filled with donor skin)
+        assert filled[230, 205] == 0
+        assert fill_mask[230, 205] == 0
+        assert info["preserved_count"] >= 1
 
 
 class TestSimilarityTransform:

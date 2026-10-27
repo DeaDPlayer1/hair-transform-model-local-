@@ -142,6 +142,21 @@ def estimate_head_geometry(landmarks_2d: np.ndarray) -> Dict[str, Any]:
     }
 
 
+def estimate_yaw_robust_scale(ref_geom: Dict[str, Any], target_geom: Dict[str, Any]) -> Optional[float]:
+    """Face height (forehead-to-chin) is a vertical measurement and stays
+    roughly stable under yaw (left-right head turn), unlike horizontal
+    measurements (temple width, interocular distance) which foreshorten as
+    the head turns away from frontal. Use it to sanity-check scale when the
+    reference and target aren't posed the same way."""
+    if not (ref_geom.get("valid") and target_geom.get("valid")):
+        return None
+    ref_h = ref_geom.get("head_height", 0)
+    tgt_h = target_geom.get("head_height", 0)
+    if ref_h < 10 or tgt_h < 10:
+        return None
+    return float(tgt_h / ref_h)
+
+
 def selective_fill_reference_mask_holes(
     ref_hair_binary: np.ndarray,
     reference_rgb: np.ndarray,
@@ -181,6 +196,10 @@ def selective_fill_reference_mask_holes(
     inv = cv2.bitwise_not(binary)
     num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(inv, connectivity=8)
 
+    hair_pixels = reference_rgb[binary > 0]
+    hair_med = np.median(hair_pixels, axis=0) if len(hair_pixels) > 0 else np.array([45.0, 30.0, 20.0], dtype=np.float32)
+    ycrcb = cv2.cvtColor(reference_rgb, cv2.COLOR_RGB2YCrCb)
+
     fill_mask = np.zeros_like(binary)
     filled_components = []
     preserved_components = []
@@ -199,24 +218,34 @@ def selective_fill_reference_mask_holes(
         mask_c = (labels == i)
         pix = reference_rgb[mask_c]
         p_mean = pix.mean(axis=0)
+        cr_mean = float(np.mean(ycrcb[mask_c, 1]))
+        cb_mean = float(np.mean(ycrcb[mask_c, 2]))
+
         dist_bg = float(np.linalg.norm(p_mean - bg_mean))
-        is_skin = bool((p_mean[0] > p_mean[1] > p_mean[2]) and (p_mean[0] - p_mean[2] > 18))
+        dist_hair = float(np.linalg.norm(p_mean - hair_med))
+
+        is_skin = bool(
+            ((p_mean[0] > p_mean[1] > p_mean[2]) and (p_mean[0] - p_mean[2] > 12))
+            or (130 <= cr_mean <= 185 and 75 <= cb_mean <= 135 and p_mean[0] > p_mean[2])
+        )
+        is_bg = bool(
+            (dist_bg < 50.0 and dist_bg < dist_hair * 0.9)
+            or (p_mean.mean() > 130 and (np.max(p_mean) - np.min(p_mean)) < 35 and dist_hair > 30.0)
+        )
 
         # Decision rules:
-        # 1. Tiny voids (<= tiny_thresh): segmentation dropout within hair mass -> fill
-        # 2. Moderate voids (<= max_thresh) that are skin or distinct from studio background:
-        #    enclosed gaps showing skin or internal head -> fill
-        # 3. Loops matching background color (dist_bg < 35 and not is_skin):
-        #    legitimate curl loops and open spaces showing studio backdrop -> PRESERVE
-        # 4. Large voids (> max_thresh): legitimate open regions, face, or background -> PRESERVE
-        if area <= tiny_thresh:
+        # Enclosed voids showing skin (forehead, temples) or background (curl loops)
+        # are legitimate open apertures that MUST NOT be filled into the hair mask.
+        # When preserved with alpha = 0, the target's own skin/background shows through.
+        # Only tiny segmentation dropouts (<= tiny_thresh) that match interior hair color
+        # and are neither skin nor backdrop are filled.
+        if is_skin or is_bg:
+            preserved_components.append((i, area, "skin_gap" if is_skin else "bg_aperture"))
+        elif area <= tiny_thresh and dist_hair < 65.0:
             fill_mask[mask_c] = 255
-            filled_components.append((i, area, "tiny_void"))
-        elif area <= max_thresh and (is_skin or dist_bg > 35.0):
-            fill_mask[mask_c] = 255
-            filled_components.append((i, area, "skin_forehead_pocket" if is_skin else "internal_gap"))
+            filled_components.append((i, area, "tiny_hair_dropout"))
         else:
-            preserved_components.append((i, area, dist_bg))
+            preserved_components.append((i, area, "interior_void"))
 
     filled_binary = cv2.bitwise_or(binary, fill_mask)
     info = {
@@ -547,6 +576,59 @@ def warp_reference_hair(
     return warped_rgb, warped_alpha
 
 
+def extend_hair_to_ear_line(
+    aligned_alpha: np.ndarray,
+    target_landmarks: Optional[Dict[str, Any]],
+    target_shape: Tuple[int, int],
+    aligned_rgb: Optional[np.ndarray] = None,
+) -> Any:
+    """If donor coverage doesn't reach the natural ear-line, locally extend
+    it toward the ear instead of rescaling the whole hairstyle. Self-gating:
+    styles that already cover this area (curly, voluminous) are untouched
+    because their coverage already exceeds the threshold below."""
+    h, w = target_shape[:2]
+    if not target_landmarks or not target_landmarks.get("detected"):
+        return (aligned_alpha, aligned_rgb) if aligned_rgb is not None else aligned_alpha
+    lms = target_landmarks["landmarks_2d"]
+    iod = float(np.linalg.norm(lms[33] - lms[263])) if len(lms) > 263 else float(w * 0.25)
+    half_band = max(4, int(round(iod * 0.10)))
+
+    for ear_idx in (234, 454):
+        if ear_idx >= len(lms):
+            continue
+        ex, ey = lms[ear_idx]
+        band_y_top = max(0, int(ey - h * 0.10))
+        band_y_bot = min(h, int(ey + h * 0.02))
+        x1, x2 = max(0, int(ex) - half_band), min(w, int(ex) + half_band)
+        
+        # Check coverage specifically at the ear line (lower half of band)
+        lower_y = max(0, int(ey - h * 0.04))
+        lower_col = aligned_alpha[lower_y:band_y_bot, x1:x2]
+        if lower_col.size == 0 or float(np.mean(lower_col > 0.3)) >= 0.65:
+            continue  # already covered at ear line -- skip
+
+        src_row = next(
+            (y for y in range(band_y_top, band_y_bot)
+             if np.mean(aligned_alpha[y, x1:x2] > 0.3) > 0.4),
+            None,
+        )
+        if src_row is None:
+            continue
+        fill_alpha = aligned_alpha[src_row:src_row + 1, x1:x2]
+        fill_rgb = aligned_rgb[src_row:src_row + 1, x1:x2] if aligned_rgb is not None else None
+
+        for y in range(src_row, band_y_bot):
+            blend = (y - src_row) / max(1, band_y_bot - src_row)
+            new_alpha = np.maximum(aligned_alpha[y, x1:x2], fill_alpha[0] * (1.0 - 0.5 * blend))
+            if aligned_rgb is not None and fill_rgb is not None:
+                increased = (new_alpha > aligned_alpha[y, x1:x2]) & (new_alpha > 0.1)
+                if np.any(increased):
+                    aligned_rgb[y, x1:x2][increased] = fill_rgb[0][increased]
+            aligned_alpha[y, x1:x2] = new_alpha
+
+    return (aligned_alpha, aligned_rgb) if aligned_rgb is not None else aligned_alpha
+
+
 # ─── Protected Region Mask ────────────────────────────────────────────
 
 class FacialProtectionResult(tuple):
@@ -658,6 +740,21 @@ def build_facial_protection_mask(
                 erode_px += 1
             k_poly = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (erode_px, erode_px))
             face_poly_eroded = cv2.erode(face_poly_mask, k_poly, iterations=1)
+
+            # Temple corners: larger erosion restricted to temple band to give voluminous/curly hair room
+            temple_erode_px = max(erode_px, int(round(iod * 0.12)))
+            if temple_erode_px % 2 == 0:
+                temple_erode_px += 1
+            k_temple = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (temple_erode_px, temple_erode_px))
+            face_poly_temple_eroded = cv2.erode(face_poly_mask, k_temple, iterations=1)
+
+            temple_band = np.zeros((h, w), dtype=np.uint8)
+            for idx in (70, 300, 103, 332, 234, 454):  # outer brow + temple + tragus
+                if idx < len(lms):
+                    pt_coords = (int(lms[idx][0]), int(lms[idx][1]))
+                    cv2.circle(temple_band, pt_coords, int(iod * 0.35), 255, -1)
+
+            face_poly_eroded = np.where(temple_band > 0, face_poly_temple_eroded, face_poly_eroded).astype(np.uint8)
 
             identity_protection = np.maximum(identity_protection, face_poly_eroded)
             face_feat_mask = np.maximum(face_feat_mask, face_poly_eroded)
@@ -789,6 +886,7 @@ def harmonize_hair_color(
     strength: float = 0.40,
     target_segmentation_map: Optional[np.ndarray] = None,
     target_landmarks: Optional[Dict[str, Any]] = None,
+    match_chroma: bool = False,
 ) -> np.ndarray:
     """
     Match color and lighting temperature of aligned reference hair to target in CIE LAB space.
@@ -862,8 +960,9 @@ def harmonize_hair_color(
         l_offset = float(np.clip((skin_l - 62.0) * 0.20 * strength, -15.0, 15.0))
 
         result_lab[core_indices, 0] = np.clip(ref_lab[core_indices, 0] + l_offset, 0, 255)
-        result_lab[core_indices, 1] = np.clip(ref_lab[core_indices, 1] + delta_a, 0, 255)
-        result_lab[core_indices, 2] = np.clip(ref_lab[core_indices, 2] + delta_b, 0, 255)
+        if match_chroma:
+            result_lab[core_indices, 1] = np.clip(ref_lab[core_indices, 1] + delta_a, 0, 255)
+            result_lab[core_indices, 2] = np.clip(ref_lab[core_indices, 2] + delta_b, 0, 255)
 
     result_lab = np.clip(result_lab, 0, 255).astype(np.uint8)
     result_bgr = cv2.cvtColor(result_lab, cv2.COLOR_LAB2BGR)
@@ -933,6 +1032,13 @@ def apply_contact_shadow(
     # Narrow contact boundary: positive only immediately beneath terminating hair strands
     shadow_raw = shifted_alpha * np.clip(1.0 - alpha, 0.0, 1.0)
 
+    # Interior low-alpha gaps within hair footprint receive milder occlusion
+    gap_k = max(5, int(round(9 * scale)))
+    if gap_k % 2 == 0:
+        gap_k += 1
+    interior_gap = (alpha < 0.25) & (cv2.dilate((alpha > 0.5).astype(np.uint8), np.ones((gap_k, gap_k), np.uint8)) > 0)
+    shadow_raw = np.maximum(shadow_raw, interior_gap.astype(np.float32) * 0.5)
+
     # Gaussian blur for soft natural falloff
     k_size = max(3, int(round(5 * scale * blur_sigma_scale)))
     if k_size % 2 == 0:
@@ -979,6 +1085,13 @@ def apply_contact_shadow(
     if target_segmentation_map is not None:
         # Zero out background wall
         skin_mask[seg == 0] = False
+
+    # Check if hair overlaps forehead skin:
+    # Short crops or styles without bangs that do not overlap the forehead should not receive shadow
+    hair_on_forehead = (alpha > 0.3) & skin_mask
+    min_overlap_px = int(round(50 * (scale ** 2)))
+    if np.count_nonzero(hair_on_forehead) < min_overlap_px:
+        return target_rgb.copy(), np.zeros((h, w), dtype=np.float32)
 
     shadow_map = np.zeros((h, w), dtype=np.float32)
     shadow_map[skin_mask] = shadow_blur[skin_mask]
@@ -1517,6 +1630,7 @@ def align_reference_to_target(
     target_landmarks: Optional[Dict[str, Any]] = None,
     reference_landmarks: Optional[Dict[str, Any]] = None,
     target_segmentation_map: Optional[np.ndarray] = None,
+    reference_segmentation_map: Optional[np.ndarray] = None,
     cranial_expansion_px: int = 20,
     feather_width_px: float = 6.0,
     hairline_transition_px: int = HAIRLINE_TRANSITION_PX,
@@ -1605,11 +1719,19 @@ def align_reference_to_target(
                 reference_landmarks["landmarks_2d"], w_r
             )
 
-    # ── Prune false-positive studio backdrop from reference hair mask ──
-    ref_hair_np_clean, prune_info = refine_reference_hair_mask(reference_rgb, ref_hair_np, reference_landmarks)
+    # ── Prune false-positive studio backdrop & exclude donor forehead skin ──
+    ref_hair_np_clean, prune_info = refine_reference_hair_mask(
+        reference_rgb,
+        ref_hair_np,
+        reference_landmarks,
+        reference_segmentation_map=reference_segmentation_map,
+    )
     pruned_count = int(prune_info["pruned_count"])
     if pruned_count > 0:
         warnings.append(f"Pruned {pruned_count} false-positive backdrop pixels from reference hair mask.")
+    skin_excl_count = int(prune_info.get("skin_exclusion_count", 0))
+    if skin_excl_count > 0:
+        warnings.append(f"Excluded {skin_excl_count} donor forehead skin pixels from reference hair mask.")
 
     # ── Selective mask-hole cleanup ──
     ref_hair_filled, fill_mask, fill_info = selective_fill_reference_mask_holes(
@@ -1629,6 +1751,7 @@ def align_reference_to_target(
         ref_hair_binary,
         bounded_decontamination=bounded_decontamination,
         ring_radius_px=ring_radius_px,
+        donor_skin_color=prune_info.get("donor_skin_color"),
     )
     ref_hair_rgb = decontaminated_rgb
 
@@ -1705,6 +1828,48 @@ def align_reference_to_target(
                 "warnings": warnings,
             }
 
+    # ── Pose-mismatch scale sanity guard ──
+    # Horizontal-distance-based scale (RANSAC and the fallback both use it)
+    # inflates under yaw. Clamp against a yaw-robust vertical estimate.
+    yaw_mismatch = pose_info.get("mirrored_diff", 0.0) if should_mirror else pose_info.get("unmirrored_diff", 0.0)
+
+    if transform_info.get("valid") and yaw_mismatch > 20.0:
+        plausible_scale = estimate_yaw_robust_scale(ref_geom, target_geom)
+        if plausible_scale is not None:
+            computed_scale = float(transform_info.get("scale", 1.0))
+            ratio = computed_scale / plausible_scale
+            if ratio > 1.3 or ratio < 0.7:
+                correction = plausible_scale / computed_scale
+                M = transform_info["matrix"].copy()
+                if target_geom.get("valid") and "nasion" in target_geom:
+                    cx = float(target_geom["nasion"][0])
+                    cy = float(target_geom["nasion"][1])
+                else:
+                    cx = float(w_t / 2.0)
+                    cy = float(h_t / 2.0)
+                M[:, :2] *= correction
+                M[0, 2] = cx - correction * (cx - M[0, 2])
+                M[1, 2] = cy - correction * (cy - M[1, 2])
+                transform_info["matrix"] = M
+                transform_info["original_scale"] = computed_scale
+                transform_info["scale"] = plausible_scale
+                transform_info["scale_corrected"] = True
+                transform_info["scale_correction_ratio"] = round(ratio, 3)
+                warnings.append(
+                    f"Scale correction: {computed_scale:.2f}x deviated {ratio:.2f}x from "
+                    f"the yaw-robust estimate ({plausible_scale:.2f}x) under a "
+                    f"{yaw_mismatch:.1f}° pose mismatch — rescaled around the target's face center."
+                )
+
+        if yaw_mismatch > 45.0:
+            transform_info["pose_quality_flag"] = "poor"
+            warnings.append(
+                f"REFERENCE POSE WARNING: this reference is turned ~{yaw_mismatch:.0f}° "
+                "from frontal. A 2D CPU pipeline can't reconstruct the occluded side of "
+                "the hairstyle from this angle — the correction above reduces distortion "
+                "but can't fully compensate. For best results, use a closer-to-frontal reference."
+            )
+
     # ── Warp reference hair into target space ──
     M = transform_info["matrix"]
     warped_rgb, warped_alpha = warp_reference_hair(
@@ -1712,6 +1877,18 @@ def align_reference_to_target(
         reference_alpha=ref_hair_alpha,
         transform_matrix=M,
         target_shape=target_shape,
+    )
+
+    # Magnified source texture reads as jagged/blocky — smooth proportionally
+    # to how much enlargement actually happened.
+    applied_scale = float(transform_info.get("scale", 1.0))
+    if applied_scale > 1.3:
+        smooth_px = max(1, int(round((applied_scale - 1.0) * 6)))
+        k = smooth_px * 2 + 1
+        warped_alpha = cv2.GaussianBlur(warped_alpha, (k, k), 0)
+
+    warped_alpha, warped_rgb = extend_hair_to_ear_line(
+        warped_alpha, target_landmarks, target_shape, aligned_rgb=warped_rgb
     )
 
     # ── Build protection and transition masks (2D distance transform, no horizontal seam) ──
@@ -1730,9 +1907,10 @@ def align_reference_to_target(
         aligned_hair_alpha=warped_alpha,
         target_rgb=target_rgb,
         target_hair_mask_np=target_hair_np,
-        strength=0.40,
+        strength=0.15,
         target_segmentation_map=target_segmentation_map,
         target_landmarks=target_landmarks,
+        match_chroma=False,
     )
 
     # ── Scale-aware parameter derivation from head geometry ──
@@ -1825,6 +2003,11 @@ def align_reference_to_target(
     if shadow_map is not None and np.any(shadow_map > 0):
         previews["contact_shadow_map"] = (shadow_map * 255).astype(np.uint8)
 
+    ref_skin_excl_img = prune_info.get("reference_skin_exclusion_mask")
+    ref_alpha_refined_img = Image.fromarray((ref_hair_alpha * 255).astype(np.uint8))
+    ref_mask_sbs_img = prune_info.get("reference_hair_mask_before_after")
+    donor_bleed_prev_img = prune_info.get("donor_skin_bleed_preview")
+
     preview_paths = {}
     if save_previews_dir:
         preview_paths = save_alignment_previews(previews, save_previews_dir)
@@ -1837,6 +2020,13 @@ def align_reference_to_target(
             Image.fromarray(ref_hair_filled).save(p_dir / "reference_hair_mask_filled.png")
             Image.fromarray(fill_mask).save(p_dir / "reference_hair_mask_holes.png")
             Image.fromarray(validation_overlay).save(p_dir / "repair_mask_validation_overlay.png")
+            if ref_skin_excl_img is not None:
+                ref_skin_excl_img.save(p_dir / "reference_skin_exclusion_mask.png")
+            ref_alpha_refined_img.save(p_dir / "reference_hair_alpha_refined.png")
+            if ref_mask_sbs_img is not None:
+                ref_mask_sbs_img.save(p_dir / "reference_hair_mask_before_after.png")
+            if donor_bleed_prev_img is not None:
+                donor_bleed_prev_img.save(p_dir / "donor_skin_bleed_preview.png")
             if shadow_map is not None:
                 Image.fromarray((shadow_map * 255).astype(np.uint8)).save(p_dir / "contact_shadow_map.png")
             preview_paths["decontaminated_reference"] = str(p_dir / "decontaminated_reference.png")
@@ -1864,6 +2054,10 @@ def align_reference_to_target(
         "buffer_protection": hard_protection,
         "decontaminated_reference_rgb": decontaminated_rgb,
         "reference_hair_alpha": ref_hair_alpha,
+        "reference_skin_exclusion_mask": ref_skin_excl_img,
+        "reference_hair_alpha_refined": ref_alpha_refined_img,
+        "reference_hair_mask_before_after": ref_mask_sbs_img,
+        "donor_skin_bleed_preview": donor_bleed_prev_img,
         "reference_mask_filled": ref_hair_filled,
         "reference_fill_mask": fill_mask,
         "fill_info": fill_info,

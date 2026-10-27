@@ -147,13 +147,17 @@ def prepare_reference_crop(
             else:
                 # Targeted Fix:
                 # 1. Edge Color Decontamination: remove donor background color bleed from boundary fringe
-                k_core = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+                scale_crop = max(crop.shape[:2]) / 512.0
+                core_k = max(3, int(round(3 * scale_crop))) | 1   # force odd
+                dil_k = max(5, int(round(9 * scale_crop))) | 1
+                k_core = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (core_k, core_k))
                 core = cv2.erode(crop_mask, k_core, iterations=1)
                 if np.any(core > 0):
-                    k_dil = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+                    k_dil = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dil_k, dil_k))
                     dil = cv2.dilate(crop_mask, k_dil, iterations=1)
                     fringe_unknown = ((dil > 0) & (core == 0)).astype(np.uint8)
-                    decontam_crop = cv2.inpaint(crop, fringe_unknown, 5, cv2.INPAINT_TELEA)
+                    inpaint_radius = max(3, int(round(5 * scale_crop)))
+                    decontam_crop = cv2.inpaint(crop, fringe_unknown, inpaint_radius, cv2.INPAINT_TELEA)
                 else:
                     decontam_crop = crop.copy()
 

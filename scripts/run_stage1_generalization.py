@@ -37,6 +37,7 @@ from src.bald_converter import (
     evaluate_stage1_quality_gate,
 )
 from src.local_generative_transfer import load_local_generative_pipeline
+from src.image_preprocessing import load_and_validate_image
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("stage1_generalization")
@@ -80,14 +81,11 @@ def run_campaign(
     inventory: List[Dict[str, Any]] = []
 
     for t_path in targets:
-        with Image.open(t_path) as im:
-            w, h = im.size
-            mode = im.mode
-            fmt = im.format
-            file_bytes = t_path.stat().st_size
-
-        t_img = Image.open(t_path)
-        t_rgb = t_img.convert("RGB")
+        t_rgb = load_and_validate_image(t_path)
+        w, h = t_rgb.size
+        mode = t_rgb.mode
+        fmt = t_path.suffix.lstrip(".").upper()
+        file_bytes = t_path.stat().st_size
 
         # Hair segmentation
         hair_mask_pil, _, seg_elapsed, hair_cov, seg_map = segment_hair(t_rgb, return_seg_map=True)
@@ -156,9 +154,8 @@ def run_campaign(
 
         logger.info(f"[{idx}/{len(targets)}] Processing {t_path.name}...")
 
-        target_img = Image.open(t_path)
-        w_orig, h_orig = target_img.size
-        target_rgb = target_img.convert("RGB")
+        target_rgb = load_and_validate_image(t_path)
+        w_orig, h_orig = target_rgb.size
 
         # Segmentation & landmarks
         hair_mask_pil, _, _, _, seg_map = segment_hair(target_rgb, return_seg_map=True)

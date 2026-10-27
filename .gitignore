@@ -67,6 +67,8 @@ outputs/stage1_generalization/
 outputs/stage2_validation/
 outputs/test_*/
 outputs/test_*
+outputs/alignment_diagnostics/
+outputs/baseline_reproduction_*/
 models/bald_converter/
 scratch/
 graphify-out/

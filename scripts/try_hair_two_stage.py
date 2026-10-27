@@ -104,6 +104,12 @@ def parse_args():
         help="Run Stage 1 only (bald conversion and scalp generation) and exit before Stage 2",
     )
     parser.add_argument(
+        "--bald-base",
+        type=str,
+        default=None,
+        help="Optional path to existing bald base image to skip Stage 1 bald conversion (e.g. outputs/.../bald_base.png)",
+    )
+    parser.add_argument(
         "--headwear-mask",
         type=str,
         default=None,
@@ -216,8 +222,10 @@ def main():
     # 1. Load images and check dimensions
     print("[1/5] Loading target image...")
     try:
-        target_img = Image.open(target_path).convert("RGB")
-        ref_img = Image.open(ref_path).convert("RGB") if ref_path else None
+        from src.image_preprocessing import load_and_validate_image
+
+        target_img = load_and_validate_image(target_path)
+        ref_img = load_and_validate_image(ref_path) if ref_path else None
     except Exception as e:
         print(f"[ERROR] Failed to read input image: {e}")
         sys.exit(1)
@@ -230,14 +238,17 @@ def main():
 
     # 2. Run segmentation and hair mask analysis
     print("[2/5] Segmenting hair masks and facial landmarks...")
-    t_seg_res = app_segment_hair(target_img, return_seg_map=True)
+    t_seg_res = app_segment_hair(target_img, return_seg_map=True, return_hair_prob=True)
     target_hair_mask = t_seg_res[0]
     target_seg_map = t_seg_res[4]
+    target_hair_prob = t_seg_res[5]
 
     ref_hair_mask = None
+    ref_seg_map = None
     if ref_img:
         r_seg_res = app_segment_hair(ref_img, return_seg_map=True)
         ref_hair_mask = r_seg_res[0]
+        ref_seg_map = r_seg_res[4]
         ref_hair_np = np.asarray(ref_hair_mask.convert("L"))
         ref_cov = (np.count_nonzero(ref_hair_np > 128) / (w_r * h_r)) * 100.0
         print(f"      Reference hair coverage: {ref_cov:.2f}% ({np.count_nonzero(ref_hair_np > 128)} px)")
@@ -264,14 +275,27 @@ def main():
 
     # 4. Execute Two-Stage Generation
     print("\n[4/5] Executing Generation Pipeline...")
-    print(f"      -> Running Stage 1: Bald conversion (backend={args.stage1_backend}, steps={args.stage1_steps})...")
+    bald_base_img = None
+    if args.bald_base:
+        b_path = resolve_image_path(args.bald_base)
+        if b_path.is_file():
+            print(f"      -> Reusing provided bald base: {b_path}")
+            bald_base_img = load_and_validate_image(b_path)
+        else:
+            print(f"      [WARN] Bald base '{args.bald_base}' not found; running Stage 1.")
+
+    if bald_base_img is None:
+        print(f"      -> Running Stage 1: Bald conversion (backend={args.stage1_backend}, steps={args.stage1_steps})...")
     res = generate_two_stage_hairstyle_transfer(
         target_image=target_img,
         reference_image=ref_img,
         pipeline=pipeline,
+        bald_base=bald_base_img,
         target_hair_mask=target_hair_mask,
         reference_hair_mask=ref_hair_mask,
         target_segmentation_map=target_seg_map,
+        reference_segmentation_map=ref_seg_map,
+        target_hair_prob=target_hair_prob,
         face_landmarks=target_lms,
         reference_landmarks=ref_lms,
         stage1_backend=args.stage1_backend,
@@ -318,13 +342,23 @@ def main():
     print(f"  • Stage 2 Broad Envelope Coverage:   {metrics['broad_envelope_coverage_pct']}%")
     print(f"  • Donor Core Curls Preserved:        {metrics['donor_core_pixel_count']} px")
 
+    trans_info = metadata.get("transform_info", {})
+    if trans_info.get("scale_corrected"):
+        print(f"  • Scale Corrected (Yaw-Robust):      {trans_info.get('original_scale', 0.0):.2f}x -> {trans_info.get('scale', 0.0):.2f}x")
+    if trans_info.get("pose_quality_flag") == "poor":
+        print(f"  • Pose Quality Warning:              High pose difference detected (>45°)")
+
     if res.get("experiment_dir"):
         print(f"\nSaved Run Artifacts Directory: {res['experiment_dir']}")
         print(f"  • Final Output:         {Path(res['experiment_dir']) / 'final_composite.png'}")
         print(f"  • 5-Panel Collage:      {Path(res['experiment_dir']) / 'comparison_collage.png'}")
         print(f"  • Stage 1 Bald Base:    {Path(res['experiment_dir']) / 'bald_base.png'}")
+        print(f"  • Stage 1 BG Diff:      {Path(res['experiment_dir']) / 'stage1_background_difference.png'}")
         print(f"  • Removal Overlay:      {Path(res['experiment_dir']) / 'stage1_removal_overlay.png'}")
+        print(f"  • Donor Skin Excl:      {Path(res['experiment_dir']) / 'reference_skin_exclusion_mask.png'}")
         print(f"  • Pre-Diffusion Comp:   {Path(res['experiment_dir']) / 'aligned_composite_before_diffusion.png'}")
+        print(f"  • Stage 2 Hairline ROI: {Path(res['experiment_dir']) / 'stage2_hairline_roi.png'}")
+        print(f"  • Forehead Zoom Comp:   {Path(res['experiment_dir']) / 'compare_prediff_vs_final_forehead.png'}")
     print("========================================================\n")
 
 

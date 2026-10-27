@@ -32,7 +32,7 @@ def get_hair_segmentation_session(model_path: Path = None) -> ort.InferenceSessi
     return _SESSION_CACHE
 
 
-def segment_hair(image_pil, return_seg_map=False, model_path=None):
+def segment_hair(image_pil, return_seg_map=False, model_path=None, return_hair_prob=False):
     """
     Run ResNet18 face parsing and create a binary hair mask.
 
@@ -114,12 +114,22 @@ def segment_hair(image_pil, return_seg_map=False, model_path=None):
 
     # Use the primary output and current hair class mapping.
     logits = outputs[0]
+
+    exp_logits = np.exp(logits - logits.max(axis=1, keepdims=True))
+    probs = exp_logits / exp_logits.sum(axis=1, keepdims=True)
+    hair_prob_512 = probs[0, HAIR_CLASS].astype(np.float32)
+
     segmentation = np.argmax(logits, axis=1)[0]
 
     mask_512 = (segmentation == HAIR_CLASS).astype(np.uint8) * 255
 
-    # Remove the padding from the predicted mask.
+    # Remove the padding from the predicted mask and probability map.
     mask_cropped = mask_512[
+        y_offset : y_offset + new_h,
+        x_offset : x_offset + new_w,
+    ]
+
+    prob_cropped = hair_prob_512[
         y_offset : y_offset + new_h,
         x_offset : x_offset + new_w,
     ]
@@ -129,6 +139,12 @@ def segment_hair(image_pil, return_seg_map=False, model_path=None):
         mask_cropped,
         (original_width, original_height),
         interpolation=cv2.INTER_NEAREST,
+    )
+
+    hair_prob = cv2.resize(
+        prob_cropped,
+        (original_width, original_height),
+        interpolation=cv2.INTER_LINEAR,
     )
 
     seg_cropped = segmentation[
@@ -157,6 +173,24 @@ def segment_hair(image_pil, return_seg_map=False, model_path=None):
         if mask.size
         else 0.0
     )
+
+    if return_hair_prob:
+        if return_seg_map:
+            return (
+                Image.fromarray(mask, mode="L"),
+                Image.fromarray(overlay, mode="RGB"),
+                elapsed,
+                coverage,
+                seg_map,
+                hair_prob,
+            )
+        return (
+            Image.fromarray(mask, mode="L"),
+            Image.fromarray(overlay, mode="RGB"),
+            elapsed,
+            coverage,
+            hair_prob,
+        )
 
     if return_seg_map:
         return (

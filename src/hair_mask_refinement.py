@@ -28,6 +28,7 @@ def refine_reference_hair_mask(
     reference_rgb: np.ndarray,
     reference_hair_mask: np.ndarray,
     landmarks_dict: Optional[Dict[str, Any]] = None,
+    reference_segmentation_map: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
     """
     Prune studio-backdrop pixels that the hair parser labeled as hair.
@@ -123,20 +124,125 @@ def refine_reference_hair_mask(
             continue
         prune_mask[comp] = True
 
-    # Sanity guard: Pruning should NEVER wipe out more than 35% of the total hair mask
     total_hair_px = np.count_nonzero(hair)
     pruned_px = np.count_nonzero(prune_mask)
+
+    # Any single pruned component at or above this size is a confirmed
+    # backdrop blob (real hair-texture gaps are small and numerous, not
+    # one big contiguous patch) — it is ALWAYS removed, independent of
+    # the aggregate guard below. Dynamically scales with total hair mask area.
+    max_single_blob_px = max(int(round(total_hair_px * 0.004)), 120)
+
     if total_hair_px > 0 and (pruned_px / total_hair_px) > 0.35:
-        # Fallback: only prune pixels that are on the outer perimeter (outer 3% border)
+        prune_u8 = prune_mask.astype(np.uint8)
+        n_p, labels_p, stats_p, _ = cv2.connectedComponentsWithStats(prune_u8, connectivity=8)
+
         border_margin = max(3, int(min(w_r, h_r) * 0.03))
         perimeter_mask = np.zeros((h_r, w_r), dtype=bool)
         perimeter_mask[:border_margin, :] = True
         perimeter_mask[:, :border_margin] = True
         perimeter_mask[:, -border_margin:] = True
-        prune_mask = prune_mask & perimeter_mask
+
+        rescued_prune_mask = np.zeros((h_r, w_r), dtype=bool)
+        for i in range(1, n_p):
+            area_p = int(stats_p[i, cv2.CC_STAT_AREA])
+            comp_p = (labels_p == i)
+            if area_p >= max_single_blob_px:
+                rescued_prune_mask[comp_p] = True          # confirmed blob: always prune
+            else:
+                rescued_prune_mask[comp_p & perimeter_mask] = True  # speck: conservative fallback
+
+        prune_mask = rescued_prune_mask
 
     cleaned = ref_hair_np.copy()
     cleaned[prune_mask] = 0
+
+    # ── Donor Forehead Skin Exclusion ──
+    skin_exclusion_mask = np.zeros((h_r, w_r), dtype=bool)
+    donor_skin_med = np.array([180.0, 140.0, 110.0], dtype=np.float32)
+    if landmarks_dict is not None and landmarks_dict.get("detected"):
+        raw_pts = landmarks_dict.get("landmarks_2d", [])
+        if len(raw_pts) >= 468:
+            pts = np.array(raw_pts, dtype=np.float32)
+            # Skin sample from landmarks (forehead, nose bridge, cheeks)
+            skin_indices = [10, 67, 109, 108, 151, 337, 338, 297, 168, 6, 197, 195, 5, 4, 1, 205, 425, 50, 280]
+            valid_skin = [idx for idx in skin_indices if idx < len(pts)]
+            if valid_skin:
+                s_pts = pts[valid_skin]
+                sx = np.clip(s_pts[:, 0].astype(int), 0, w_r - 1)
+                sy = np.clip(s_pts[:, 1].astype(int), 0, h_r - 1)
+                # Exclude any landmark points covered by hair
+                non_hair_idx = [i for i in range(len(valid_skin)) if not hair[sy[i], sx[i]]]
+                if non_hair_idx:
+                    donor_skin_sample = ref_rgb[sy[non_hair_idx], sx[non_hair_idx]]
+                    donor_skin_med = np.median(donor_skin_sample, axis=0).astype(np.float32)
+
+            brow_indices = [70, 63, 105, 66, 107, 336, 296, 334, 293, 300]
+            valid_brows = [idx for idx in brow_indices if idx < len(pts)]
+            brow_y = float(np.mean([pts[i, 1] for i in valid_brows])) if valid_brows else float(h_r * 0.45)
+            top_fh_y = float(pts[10, 1]) if 10 < len(pts) else float(h_r * 0.25)
+            face_h = float(abs(pts[152, 1] - top_fh_y)) if 152 < len(pts) else float(h_r * 0.5)
+
+            # Fringe zone: between upper forehead and brow line
+            fringe_y1 = max(0, int(top_fh_y - 0.15 * face_h))
+            fringe_y2 = min(h_r, int(brow_y + 0.12 * face_h))
+            fringe_margin_x = max(5, int(round(face_h * 0.04)))
+            fringe_x1 = max(0, int(pts[234, 0] - fringe_margin_x)) if 234 < len(pts) else 0
+            fringe_x2 = min(w_r, int(pts[454, 0] + fringe_margin_x)) if 454 < len(pts) else w_r
+
+            in_fringe_zone = np.zeros((h_r, w_r), dtype=bool)
+            in_fringe_zone[fringe_y1:fringe_y2, fringe_x1:fringe_x2] = True
+
+            # Color model for skin: YCrCb
+            ycrcb = cv2.cvtColor(ref_rgb, cv2.COLOR_RGB2YCrCb)
+            cr = ycrcb[:, :, 1]
+            cb = ycrcb[:, :, 2]
+            is_skin_chroma = (
+                (cr >= 130) & (cr <= 180) & (cb >= 75) & (cb <= 135)
+                & (ref_rgb[:, :, 0] > ref_rgb[:, :, 1]) & (ref_rgb[:, :, 1] > ref_rgb[:, :, 2])
+            )
+
+            dist_skin = np.linalg.norm(ref_rgb.astype(np.float32) - donor_skin_med, axis=-1)
+            dist_core_hair = np.linalg.norm(ref_rgb.astype(np.float32) - core_hair_color, axis=-1)
+
+            is_seg_skin = False
+            if reference_segmentation_map is not None:
+                seg_r = reference_segmentation_map
+                if seg_r.shape[:2] != (h_r, w_r):
+                    seg_r = cv2.resize(seg_r, (w_r, h_r), interpolation=cv2.INTER_NEAREST)
+                is_seg_skin = (seg_r == 1)
+
+            # Donor skin exclusion criteria:
+            # Must be in hair mask AND (seg skin OR (in fringe zone AND skin chroma AND closer to skin than hair AND not dark strand))
+            skin_exclusion_mask = (
+                hair
+                & (
+                    is_seg_skin
+                    | (
+                        in_fringe_zone
+                        & is_skin_chroma
+                        & (dist_skin < dist_core_hair)
+                        & (ref_rgb.mean(axis=-1) > 50)
+                    )
+                )
+            )
+
+    # Exclude donor skin from cleaned mask
+    cleaned[skin_exclusion_mask] = 0
+
+    # Build Phase 2 diagnostic images
+    skin_excl_u8 = skin_exclusion_mask.astype(np.uint8) * 255
+    ref_skin_excl_pil = Image.fromarray(skin_excl_u8, mode="L")
+
+    # donor_skin_bleed_preview: reference image with excluded skin highlighted in bright red
+    donor_bleed_preview = ref_rgb.copy()
+    donor_bleed_preview[skin_exclusion_mask] = [255, 30, 30]
+    donor_bleed_preview_pil = Image.fromarray(donor_bleed_preview, mode="RGB")
+
+    # reference_hair_mask_before_after: side-by-side
+    mask_before_after = np.hstack([ref_hair_np, cleaned])
+    mask_before_after_pil = Image.fromarray(mask_before_after, mode="L")
+
     info = {
         "pruned_count": int(np.count_nonzero(prune_mask)),
         "backdrop_color": backdrop_color,
@@ -144,6 +250,12 @@ def refine_reference_hair_mask(
         "prune_threshold": prune_threshold,
         "is_backdrop": is_backdrop,
         "prune_mask": prune_mask,
+        "skin_exclusion_count": int(np.count_nonzero(skin_exclusion_mask)),
+        "skin_exclusion_mask": skin_excl_u8,
+        "reference_skin_exclusion_mask": ref_skin_excl_pil,
+        "donor_skin_bleed_preview": donor_bleed_preview_pil,
+        "reference_hair_mask_before_after": mask_before_after_pil,
+        "donor_skin_color": donor_skin_med,
     }
     return cleaned, info
 
@@ -153,6 +265,7 @@ def decontaminate_reference_hair_rgb(
     ref_hair_binary: np.ndarray,
     bounded_decontamination: bool = True,
     ring_radius_px: Optional[int] = None,
+    donor_skin_color: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Replace contaminated hair-edge RGB with interior hair color.
@@ -189,7 +302,7 @@ def decontaminate_reference_hair_rgb(
         core_pixels = reference_rgb[core_hair > 0]
         median_hair = np.median(core_pixels, axis=0).astype(np.uint8) if len(core_pixels) > 0 else np.array([50, 35, 25], dtype=np.uint8)
 
-        # Identify rim pixels that are actually contaminated by studio backdrop
+        # Identify rim pixels that are actually contaminated by studio backdrop or donor skin
         ref_hsv = cv2.cvtColor(reference_rgb, cv2.COLOR_RGB2HSV)
         backdrop_color = np.median(reference_rgb[:max(5, int(h_r * 0.03)), :max(5, int(w_r * 0.03))], axis=(0, 1))
         dist_to_bg = np.linalg.norm(reference_rgb.astype(np.float32) - backdrop_color, axis=-1)
@@ -209,7 +322,12 @@ def decontaminate_reference_hair_rgb(
             & (dist_to_bg < 75.0)
             & (dist_to_bg < dist_to_hair)
         )
-        contaminated = (unknown_region > 0) & (is_bg_color_match | is_neutral_bleed)
+        is_skin_bleed = np.zeros((h_r, w_r), dtype=bool)
+        if donor_skin_color is not None:
+            dist_to_skin = np.linalg.norm(reference_rgb.astype(np.float32) - donor_skin_color, axis=-1)
+            is_skin_bleed = (dist_to_skin < 40.0) & (dist_to_skin < dist_to_hair)
+
+        contaminated = (unknown_region > 0) & (is_bg_color_match | is_neutral_bleed | is_skin_bleed)
 
         if np.any(contaminated):
             guarded_canvas = reference_rgb.copy()
